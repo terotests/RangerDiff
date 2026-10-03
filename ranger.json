@@ -1,0 +1,17 @@
+{
+  "name": "rangerdiff",
+  "version": "0.1.0",
+  "license": "MIT",
+  "dependencies": {
+    "zip": {
+      "git": "https://github.com/terotests/Ranger.git",
+      "rev": "351afc770e555aa0dc2e7fa13cda5a05fe829ba8",
+      "subdir": "lib/zip"
+    },
+    "core": {
+      "git": "https://github.com/terotests/Ranger.git",
+      "rev": "351afc770e555aa0dc2e7fa13cda5a05fe829ba8",
+      "subdir": "lib/core"
+    }
+  }
+}
