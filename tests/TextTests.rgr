@@ -1,0 +1,204 @@
+; SPDX-License-Identifier: MIT
+; Line diff, unified view, three-way merge.
+
+Import "../src/RdText.rgr"
+Import "RdTest.rgr"
+
+class TextTests {
+
+    ; apply the hunks of d to d.a; must give d.b
+    sfn rebuild:string (d:RdLineDiff) {
+        def out:[string]
+        def pos:int 0
+        for d.hunks h:RdHunk i {
+            while (pos < h.aStart) {
+                push out (itemAt d.a pos)
+                pos = (pos + 1)
+            }
+            def q:int 0
+            while (q < h.bLen) {
+                push out (itemAt d.b (h.bStart + q))
+                q = (q + 1)
+            }
+            pos = (h.aStart + h.aLen)
+        }
+        while (pos < (array_length d.a)) {
+            push out (itemAt d.a pos)
+            pos = (pos + 1)
+        }
+        return (join out "\n")
+    }
+
+    sfn deck:string () {
+        def l:[string]
+        push l "---"
+        push l "title: Q3 report"
+        push l "---"
+        push l ""
+        push l "## Revenue"
+        push l ""
+        push l "- Up 12 %"
+        push l "- New markets: Sweden"
+        push l ""
+        push l "## Costs"
+        push l ""
+        push l "- Flat"
+        push l "- Hiring paused"
+        push l ""
+        push l "## Next"
+        push l ""
+        push l "Questions?"
+        push l ""
+        return (join l "\n")
+    }
+
+    sfn basics:void (T:RdTest) {
+        T.start("line diff")
+        def a:string (TextTests.deck())
+        def b:string (replace a "- Up 12 %" "- Up 14 %")
+        def d:RdLineDiff (RdText.diff(a b))
+        T.eqInt((array_length d.hunks) 1 "one hunk")
+        T.eqInt(d.added 1 "one added")
+        T.eqInt(d.removed 1 "one removed")
+        T.eqStr((TextTests.rebuild(d)) b "rebuilds")
+        def u:string (RdText.unified(d 1))
+        T.eqStr(u "@@ -6,3 +6,3 @@\n \n-- Up 12 %\n+- Up 14 %\n - New markets: Sweden" "unified view")
+        def same:RdLineDiff (RdText.diff(a a))
+        T.eqInt((array_length same.hunks) 0 "no change, no hunks")
+        def e:RdLineDiff (RdText.diff("" a))
+        T.eqStr((TextTests.rebuild(e)) a "from empty")
+        def f:RdLineDiff (RdText.diff(a ""))
+        T.eqStr((TextTests.rebuild(f)) "" "to empty")
+    }
+
+    ; random line edits
+    sfn editLines:string (R:RdRandom text:string) {
+        def l:[string] (RdText.lines(text))
+        def out:[string]
+        for l s:string i {
+            def r:int (R.below(20))
+            if (r == 0) {
+                ; dropped
+            } {
+                if (r == 1) {
+                    push out (s + " (edited)")
+                } {
+                    if (r == 2) {
+                        push out s
+                        push out ("new line " + (to_string (R.below(1000))))
+                    } {
+                        push out s
+                    }
+                }
+            }
+        }
+        return (join out "\n")
+    }
+
+    sfn randomText:string (R:RdRandom n:int) {
+        def out:[string]
+        def i:int 0
+        while (i < n) {
+            push out ("line " + (to_string (R.below(50))))
+            i = (i + 1)
+        }
+        return (join out "\n")
+    }
+
+    sfn random:void (T:RdTest) {
+        T.start("random line diffs")
+        def R (new RdRandom(321))
+        def round:int 0
+        while (round < 200) {
+            def a:string (TextTests.randomText(R (R.below(300))))
+            def b:string (TextTests.editLines(R a))
+            def d:RdLineDiff (RdText.diff(a b))
+            T.ok(((TextTests.rebuild(d)) == b) ("rebuild round " + (to_string round)))
+            round = (round + 1)
+        }
+    }
+
+    sfn merges:void (T:RdTest) {
+        T.start("three-way merge")
+        def base:string (TextTests.deck())
+        ; laptop edits revenue, phone edits costs: both kept
+        def mine:string (replace base "- Up 12 %" "- Up 14 %")
+        def theirs:string (replace base "- Hiring paused" "- Hiring resumes in Q4")
+        def m1:RdMerge (RdText.merge3(base mine theirs))
+        T.ok(m1.clean() "separate edits merge cleanly")
+        def want1:string (replace mine "- Hiring paused" "- Hiring resumes in Q4")
+        T.eqStr((m1.text("markers")) want1 "both edits in the result")
+        ; adjacent lines edited on each side
+        def mine2:string (replace base "- Up 12 %" "- Up 13 %")
+        def theirs2:string (replace base "- New markets: Sweden" "- New markets: Sweden, Norway")
+        def m2:RdMerge (RdText.merge3(base mine2 theirs2))
+        T.ok(m2.clean() "adjacent lines merge cleanly")
+        T.ok(((indexOf (m2.text("markers")) "Up 13") > 0) "adjacent: mine kept")
+        T.ok(((indexOf (m2.text("markers")) "Norway") > 0) "adjacent: theirs kept")
+        ; the same edit on both sides
+        def m3:RdMerge (RdText.merge3(base mine mine))
+        T.ok(m3.clean() "identical edits are not a conflict")
+        T.eqStr((m3.text("markers")) mine "identical edits taken once")
+        ; the same line edited differently: a conflict
+        def theirs4:string (replace base "- Up 12 %" "- Up 15 %")
+        def m4:RdMerge (RdText.merge3(base mine theirs4))
+        T.eqInt(m4.conflicts 1 "one conflict")
+        T.eqStr((m4.text("mine")) mine "conflict resolved as mine")
+        T.eqStr((m4.text("theirs")) theirs4 "conflict resolved as theirs")
+        def marked:string (m4.text("markers"))
+        T.ok(((indexOf marked "<<<<<<< mine\n- Up 14 %\n=======\n- Up 15 %\n>>>>>>> theirs") > 0) "markers")
+        def picks:[string]
+        push picks "both"
+        T.ok(((indexOf (m4.resolve(picks)) "- Up 14 %\n- Up 15 %") > 0) "resolve both")
+        ; both add a slide at the end: a conflict (order unknown)
+        def mine5:string (base + "\n## Mine\n")
+        def theirs5:string (base + "\n## Theirs\n")
+        def m5:RdMerge (RdText.merge3(base mine5 theirs5))
+        T.eqInt(m5.conflicts 1 "insert at the same place conflicts")
+        T.ok(((indexOf (m5.text("both")) "## Mine") > 0) "both: mine")
+        T.ok(((indexOf (m5.text("both")) "## Theirs") > 0) "both: theirs")
+        ; one side deletes a slide, the other edits a different one
+        def mine6:string (replace base "## Next\n\nQuestions?\n" "")
+        def m6:RdMerge (RdText.merge3(base mine6 theirs))
+        T.ok(m6.clean() "delete + edit elsewhere merges")
+        T.eqStr((m6.text("markers")) (replace mine6 "- Hiring paused" "- Hiring resumes in Q4") "delete + edit result")
+        ; one side deletes what the other edits: conflict
+        def theirs7:string (replace base "Questions?" "Questions? Ask now.")
+        def m7:RdMerge (RdText.merge3(base mine6 theirs7))
+        T.eqInt(m7.conflicts 1 "delete vs edit conflicts")
+    }
+
+    sfn mergeProperties:void (T:RdTest) {
+        T.start("merge properties")
+        def R (new RdRandom(77))
+        def round:int 0
+        while (round < 150) {
+            def base:string (TextTests.randomText(R (5 + (R.below(200)))))
+            def mine:string (TextTests.editLines(R base))
+            def theirs:string (TextTests.editLines(R base))
+            def a:RdMerge (RdText.merge3(base mine base))
+            T.ok((a.clean() && ((a.text("markers")) == mine)) "theirs unchanged gives mine")
+            def b:RdMerge (RdText.merge3(base base theirs))
+            T.ok((b.clean() && ((b.text("markers")) == theirs)) "mine unchanged gives theirs")
+            def c:RdMerge (RdText.merge3(base mine mine))
+            T.ok((c.clean() && ((c.text("markers")) == mine)) "equal sides give that side")
+            def m:RdMerge (RdText.merge3(base mine theirs))
+            ; picking mine everywhere where both changed, the theirs-only
+            ; changes are still in: diffing the result against theirs must
+            ; not undo a theirs-only change, which we check by symmetry:
+            def mt:RdMerge (RdText.merge3(base theirs mine))
+            T.eqInt(m.conflicts mt.conflicts "conflict count is symmetric")
+            T.ok(((m.text("mine")) == (mt.text("theirs"))) "mine/theirs swap symmetrically")
+            round = (round + 1)
+        }
+    }
+
+    sfn main:void () {
+        def T (new RdTest())
+        TextTests.basics(T)
+        TextTests.random(T)
+        TextTests.merges(T)
+        TextTests.mergeProperties(T)
+        T.done()
+    }
+}

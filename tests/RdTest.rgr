@@ -1,0 +1,112 @@
+; SPDX-License-Identifier: MIT
+; A tiny test harness shared by the test programs.
+
+class RdRandom {
+    def seed:int 1
+
+    Constructor (s:int) {
+        seed = s
+        if (seed <= 0) {
+            seed = 1
+        }
+    }
+
+    ; Park-Miller with Schrage's method: no product leaves 32 bits
+    fn next:int () {
+        def hi:int (idiv seed 127773)
+        def lo:int (seed % 127773)
+        def t:int ((16807 * lo) - (2836 * hi))
+        if (t <= 0) {
+            t = (t + 2147483647)
+        }
+        seed = t
+        return seed
+    }
+
+    ; 0 <= value < n
+    fn below:int (n:int) {
+        if (n <= 0) {
+            return 0
+        }
+        return (this.next() % n)
+    }
+
+    fn bytes:buffer (n:int) {
+        def b:buffer (buffer_alloc n)
+        def i:int 0
+        while (i < n) {
+            (buffer_set b i (this.below(256)))
+            i = (i + 1)
+        }
+        return b
+    }
+
+    ; text-like bytes: words from a small alphabet, spaces and newlines
+    fn textBytes:buffer (n:int) {
+        def b:buffer (buffer_alloc n)
+        def i:int 0
+        while (i < n) {
+            def r:int (this.below(100))
+            def v:int (97 + (this.below(26)))
+            if (r < 15) {
+                v = 32
+            }
+            if (r == 99) {
+                v = 10
+            }
+            (buffer_set b i v)
+            i = (i + 1)
+        }
+        return b
+    }
+}
+
+class RdTest {
+    def passed:int 0
+    def failed:int 0
+    def group:string ""
+
+    Constructor () {
+    }
+
+    fn start:void (name:string) {
+        group = name
+    }
+
+    fn ok:void (cond:boolean what:string) {
+        if cond {
+            passed = (passed + 1)
+        } {
+            failed = (failed + 1)
+            print (("FAIL " + group) + (": " + what))
+        }
+    }
+
+    fn eqInt:void (got:int want:int what:string) {
+        if (got == want) {
+            passed = (passed + 1)
+        } {
+            failed = (failed + 1)
+            print (((("FAIL " + group) + (": " + what)) + (" got " + (to_string got))) + (" want " + (to_string want)))
+        }
+    }
+
+    fn eqStr:void (got:string want:string what:string) {
+        if (got == want) {
+            passed = (passed + 1)
+        } {
+            failed = (failed + 1)
+            print (((("FAIL " + group) + (": " + what)) + ("\n  got:  " + got)) + ("\n  want: " + want))
+        }
+    }
+
+    fn done:int () {
+        print ((("passed " + (to_string passed)) + ", failed ") + (to_string failed))
+        if (failed > 0) {
+            print "TESTS FAILED"
+            return 1
+        }
+        print "ALL TESTS PASSED"
+        return 0
+    }
+}

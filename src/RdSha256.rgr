@@ -1,0 +1,140 @@
+; SPDX-License-Identifier: MIT
+
+; ============================================================================
+; RdSha256.rgr — SHA-256 (FIPS 180-4) of a buffer, as 64 hex digits
+; ============================================================================
+; The id of every stored object. Built on RgU32 so the same digest comes out
+; on every target; a browser host may use crypto.subtle instead and gets the
+; same string.
+; ============================================================================
+
+Import "pkg:core/RgU32.rgr"
+Import "RdBytes.rgr"
+
+class RdSha256 {
+
+    static sfn k:[int] () {
+        def hex:[string] ([] _:string ("428a2f98" "71374491" "b5c0fbcf" "e9b5dba5" "3956c25b" "59f111f1" "923f82a4" "ab1c5ed5" "d807aa98" "12835b01" "243185be" "550c7dc3" "72be5d74" "80deb1fe" "9bdc06a7" "c19bf174" "e49b69c1" "efbe4786" "0fc19dc6" "240ca1cc" "2de92c6f" "4a7484aa" "5cb0a9dc" "76f988da" "983e5152" "a831c66d" "b00327c8" "bf597fc7" "c6e00bf3" "d5a79147" "06ca6351" "14292967" "27b70a85" "2e1b2138" "4d2c6dfc" "53380d13" "650a7354" "766a0abb" "81c2c92e" "92722c85" "a2bfe8a1" "a81a664b" "c24b8b70" "c76c51a3" "d192e819" "d6990624" "f40e3585" "106aa070" "19a4c116" "1e376c08" "2748774c" "34b0bcb5" "391c0cb3" "4ed8aa4a" "5b9cca4f" "682e6ff3" "748f82ee" "78a5636f" "84c87814" "8cc70208" "90befffa" "a4506ceb" "bef9a3f7" "c67178f2"))
+        def out:[int]
+        for hex h:string i {
+            push out (RdSha256.parse(h))
+        }
+        return out
+    }
+
+    static sfn parse:int (h:string) {
+        def hi:int (RdSha256.parse16((substring h 0 4)))
+        def lo:int (RdSha256.parse16((substring h 4 8)))
+        return (RgU32.fromHalves(hi lo))
+    }
+
+    static sfn parse16:int (h:string) {
+        def digits:string "0123456789abcdef"
+        def v:int 0
+        def i:int 0
+        while (i < 4) {
+            v = ((v * 16) + (indexOf digits (substring h i (i + 1))))
+            i = (i + 1)
+        }
+        return v
+    }
+
+    static sfn hex32:string (v:int) {
+        def digits:string "0123456789abcdef"
+        def out:string ""
+        def i:int 0
+        while (i < 4) {
+            def b:int (RgU32.byteAt(v i))
+            out = (out + (substring digits (idiv b 16) ((idiv b 16) + 1)))
+            out = (out + (substring digits (b % 16) ((b % 16) + 1)))
+            i = (i + 1)
+        }
+        return out
+    }
+
+    static sfn hash:string (data:buffer) {
+        def K:[int] (RdSha256.k())
+        def H:[int] ([] _:int ((RdSha256.parse("6a09e667")) (RdSha256.parse("bb67ae85")) (RdSha256.parse("3c6ef372")) (RdSha256.parse("a54ff53a")) (RdSha256.parse("510e527f")) (RdSha256.parse("9b05688c")) (RdSha256.parse("1f83d9ab")) (RdSha256.parse("5be0cd19"))))
+        def n:int (buffer_length data)
+        ; padded message: data, 0x80, zeros, 64-bit big-endian bit length
+        def total:int ((idiv (n + 72) 64) * 64)
+        def msg:buffer (buffer_alloc total)
+        if (n > 0) {
+            (buffer_copy msg 0 data 0 n)
+        }
+        (buffer_set msg n 128)
+        ; bit length = n * 8: below 2^31 for n < 2^28, so the top four bytes stay 0
+        def bits:int (n * 8)
+        def j:int 0
+        while (j < 4) {
+            (buffer_set msg ((total - 4) + j) (RgU32.byteAt(bits j)))
+            j = (j + 1)
+        }
+        def W:int_buffer (int_buffer_alloc 64)
+        def off:int 0
+        while (off < total) {
+            def t:int 0
+            while (t < 16) {
+                def p:int (off + (t * 4))
+                (int_buffer_set W t (RgU32.fromBytesBE((buffer_get msg p) (buffer_get msg (p + 1)) (buffer_get msg (p + 2)) (buffer_get msg (p + 3)))))
+                t = (t + 1)
+            }
+            while (t < 64) {
+                def w15:int (int_buffer_get W (t - 15))
+                def w2:int (int_buffer_get W (t - 2))
+                def s0:int (bit_xor (bit_xor (RgU32.rotr(w15 7)) (RgU32.rotr(w15 18))) (RgU32.shr(w15 3)))
+                def s1:int (bit_xor (bit_xor (RgU32.rotr(w2 17)) (RgU32.rotr(w2 19))) (RgU32.shr(w2 10)))
+                def sum1:int (RgU32.addU((int_buffer_get W (t - 16)) s0))
+                def sum2:int (RgU32.addU((int_buffer_get W (t - 7)) s1))
+                (int_buffer_set W t (RgU32.addU(sum1 sum2)))
+                t = (t + 1)
+            }
+            def a:int (itemAt H 0)
+            def b:int (itemAt H 1)
+            def c:int (itemAt H 2)
+            def d:int (itemAt H 3)
+            def e:int (itemAt H 4)
+            def f:int (itemAt H 5)
+            def g:int (itemAt H 6)
+            def h:int (itemAt H 7)
+            def i:int 0
+            while (i < 64) {
+                def S1:int (bit_xor (bit_xor (RgU32.rotr(e 6)) (RgU32.rotr(e 11))) (RgU32.rotr(e 25)))
+                def ch:int (bit_xor (bit_and e f) (bit_and (RgU32.bnot(e)) g))
+                def t1a:int (RgU32.addU(h S1))
+                def t1b:int (RgU32.addU(ch (itemAt K i)))
+                def t1:int (RgU32.addU((RgU32.addU(t1a t1b)) (int_buffer_get W i)))
+                def S0:int (bit_xor (bit_xor (RgU32.rotr(a 2)) (RgU32.rotr(a 13))) (RgU32.rotr(a 22)))
+                def maj:int (bit_xor (bit_xor (bit_and a b) (bit_and a c)) (bit_and b c))
+                def t2:int (RgU32.addU(S0 maj))
+                h = g
+                g = f
+                f = e
+                e = (RgU32.addU(d t1))
+                d = c
+                c = b
+                b = a
+                a = (RgU32.addU(t1 t2))
+                i = (i + 1)
+            }
+            (set H 0 (RgU32.addU((itemAt H 0) a)))
+            (set H 1 (RgU32.addU((itemAt H 1) b)))
+            (set H 2 (RgU32.addU((itemAt H 2) c)))
+            (set H 3 (RgU32.addU((itemAt H 3) d)))
+            (set H 4 (RgU32.addU((itemAt H 4) e)))
+            (set H 5 (RgU32.addU((itemAt H 5) f)))
+            (set H 6 (RgU32.addU((itemAt H 6) g)))
+            (set H 7 (RgU32.addU((itemAt H 7) h)))
+            off = (off + 64)
+        }
+        def out:string ""
+        for H v:int k {
+            out = (out + (RdSha256.hex32(v)))
+        }
+        return out
+    }
+
+    static sfn text:string (s:string) {
+        return (RdSha256.hash((RdBytes.fromText(s))))
+    }
+}

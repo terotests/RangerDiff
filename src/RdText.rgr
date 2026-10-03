@@ -1,0 +1,553 @@
+; SPDX-License-Identifier: MIT
+
+; ============================================================================
+; RdText.rgr — line diff (Myers), unified view, three-way merge (diff3)
+; ============================================================================
+; Text is split on "\n" and joined back with "\n", so a file round-trips
+; exactly (a trailing newline is an empty last line).
+;
+; A hunk says: base lines [aStart, aStart+aLen) became new lines
+; [bStart, bStart+bLen). aLen 0 is an insertion, bLen 0 a deletion.
+;
+; diff3(base, mine, theirs): both sides' hunks are laid on the base. A change
+; only one side made is taken. Changes of both sides that overlap in the base
+; (or insert at the same line) are one region: equal results are taken once,
+; different ones are a conflict that keeps base, mine and theirs.
+; ============================================================================
+
+class RdHunk {
+    def aStart:int 0
+    def aLen:int 0
+    def bStart:int 0
+    def bLen:int 0
+
+    Constructor () {
+    }
+}
+
+class RdLineDiff {
+    def a:[string]
+    def b:[string]
+    def hunks:[RdHunk]
+    def added:int 0
+    def removed:int 0
+
+    Constructor () {
+    }
+}
+
+class RdMergeChunk {
+    ; false: clean lines in `lines`. true: a conflict
+    def conflict:boolean false
+    def lines:[string]
+    def base:[string]
+    def mine:[string]
+    def theirs:[string]
+
+    Constructor () {
+    }
+}
+
+class RdMerge {
+    def chunks:[RdMergeChunk]
+    def conflicts:int 0
+    ; changes taken from each side without a conflict
+    def fromMine:int 0
+    def fromTheirs:int 0
+
+    Constructor () {
+    }
+
+    fn clean:boolean () {
+        return (conflicts == 0)
+    }
+
+    ; the merged text; each conflict as `pick`: "mine", "theirs", "both"
+    ; (mine then theirs) or "markers" (git-style conflict markers)
+    fn text:string (pick:string) {
+        def out:[string]
+        for chunks c:RdMergeChunk i {
+            if (c.conflict == false) {
+                for c.lines l:string j {
+                    push out l
+                }
+            } {
+                if ((pick == "mine") || (pick == "both")) {
+                    if (pick == "both") {
+                        RdText.appendAll(out c.mine)
+                        RdText.appendAll(out c.theirs)
+                    } {
+                        RdText.appendAll(out c.mine)
+                    }
+                } {
+                    if (pick == "theirs") {
+                        RdText.appendAll(out c.theirs)
+                    } {
+                        push out "<<<<<<< mine"
+                        RdText.appendAll(out c.mine)
+                        push out "======="
+                        RdText.appendAll(out c.theirs)
+                        push out ">>>>>>> theirs"
+                    }
+                }
+            }
+        }
+        return (join out "\n")
+    }
+
+    ; the text with conflict k resolved one way, the others kept as given
+    ; in `picks` (one entry per conflict, in order)
+    fn resolve:string (picks:[string]) {
+        def out:[string]
+        def k:int 0
+        for chunks c:RdMergeChunk i {
+            if (c.conflict == false) {
+                RdText.appendAll(out c.lines)
+            } {
+                def pick:string "markers"
+                if (k < (array_length picks)) {
+                    pick = (itemAt picks k)
+                }
+                k = (k + 1)
+                if ((pick == "mine") || (pick == "both")) {
+                    RdText.appendAll(out c.mine)
+                }
+                if ((pick == "theirs") || (pick == "both")) {
+                    RdText.appendAll(out c.theirs)
+                }
+                if (pick == "base") {
+                    RdText.appendAll(out c.base)
+                }
+                if (pick == "markers") {
+                    push out "<<<<<<< mine"
+                    RdText.appendAll(out c.mine)
+                    push out "======="
+                    RdText.appendAll(out c.theirs)
+                    push out ">>>>>>> theirs"
+                }
+            }
+        }
+        return (join out "\n")
+    }
+}
+
+class RdText {
+
+    static sfn lines:[string] (s:string) {
+        return (strsplit s "\n")
+    }
+
+    static sfn appendAll:void (out:[string] src:[string]) {
+        for src l:string i {
+            push out l
+        }
+    }
+
+    static sfn slice:[string] (src:[string] start:int end:int) {
+        def out:[string]
+        def i:int start
+        while (i < end) {
+            push out (itemAt src i)
+            i = (i + 1)
+        }
+        return out
+    }
+
+    ; lines as ints: equal lines get equal numbers
+    static sfn intern:int (src:[string] table:[string:int] out:int_buffer first:int) {
+        def nextId:int first
+        for src l:string i {
+            if (has table l) {
+                (int_buffer_set out i (unwrap (get table l)))
+            } {
+                (set table l nextId)
+                (int_buffer_set out i nextId)
+                nextId = (nextId + 1)
+            }
+        }
+        return nextId
+    }
+
+    static sfn diff:RdLineDiff (aText:string bText:string) {
+        return (RdText.diffLines((RdText.lines(aText)) (RdText.lines(bText))))
+    }
+
+    static sfn diffLines:RdLineDiff (a:[string] b:[string]) {
+        def res (new RdLineDiff())
+        res.a = a
+        res.b = b
+        def n:int (array_length a)
+        def m:int (array_length b)
+        def table:[string:int]
+        def A:int_buffer (int_buffer_alloc (n + 1))
+        def B:int_buffer (int_buffer_alloc (m + 1))
+        def ids:int (RdText.intern(a table A 0))
+        RdText.intern(b table B ids)
+        ; common prefix / suffix
+        def p:int 0
+        while (((p < n) && (p < m)) && ((int_buffer_get A p) == (int_buffer_get B p))) {
+            p = (p + 1)
+        }
+        def s:int 0
+        while ((((s + p) < n) && ((s + p) < m)) && ((int_buffer_get A ((n - 1) - s)) == (int_buffer_get B ((m - 1) - s)))) {
+            s = (s + 1)
+        }
+        RdText.myers(res A B p (n - s) p (m - s))
+        for res.hunks h:RdHunk i {
+            res.added = (res.added + h.bLen)
+            res.removed = (res.removed + h.aLen)
+        }
+        return res
+    }
+
+    ; Myers' O(ND) diff of A[a0,a1) and B[b0,b1); hunks appended in order.
+    ; Past MAXD edits the rest of the region is one replace hunk.
+    static sfn myers:void (res:RdLineDiff A:int_buffer B:int_buffer a0:int a1:int b0:int b1:int) {
+        def N:int (a1 - a0)
+        def M:int (b1 - b0)
+        if ((N == 0) && (M == 0)) {
+            return
+        }
+        if ((N == 0) || (M == 0)) {
+            RdText.addHunk(res a0 N b0 M)
+            return
+        }
+        def MAX:int (N + M)
+        def maxD:int MAX
+        if (maxD > 4000) {
+            maxD = 4000
+        }
+        def off:int (maxD + 1)
+        def width:int ((2 * maxD) + 3)
+        def V:int_buffer (int_buffer_alloc width)
+        ; trace: V after each d, flattened
+        def trace:[int_buffer]
+        def found:int -1
+        def d:int 0
+        while (d <= maxD) {
+            def snap:int_buffer (int_buffer_alloc width)
+            def q:int 0
+            while (q < width) {
+                (int_buffer_set snap q (int_buffer_get V q))
+                q = (q + 1)
+            }
+            push trace snap
+            def k:int (0 - d)
+            while (k <= d) {
+                def x:int 0
+                if ((k == (0 - d)) || ((k != d) && ((int_buffer_get V ((k - 1) + off)) < (int_buffer_get V ((k + 1) + off))))) {
+                    x = (int_buffer_get V ((k + 1) + off))
+                } {
+                    x = ((int_buffer_get V ((k - 1) + off)) + 1)
+                }
+                def y:int (x - k)
+                while (((x < N) && (y < M)) && ((int_buffer_get A (a0 + x)) == (int_buffer_get B (b0 + y)))) {
+                    x = (x + 1)
+                    y = (y + 1)
+                }
+                (int_buffer_set V (k + off) x)
+                if ((x >= N) && (y >= M)) {
+                    found = d
+                    break
+                }
+                k = (k + 2)
+            }
+            if (found >= 0) {
+                break
+            }
+            d = (d + 1)
+        }
+        if (found < 0) {
+            RdText.addHunk(res a0 N b0 M)
+            return
+        }
+        ; walk back: collect (x, y) of each edit, newest first
+        def xs:[int]
+        def ys:[int]
+        def kinds:[int]
+        def x2:int N
+        def y2:int M
+        def dd:int found
+        while (dd > 0) {
+            def Vd:int_buffer (itemAt trace dd)
+            def k2:int (x2 - y2)
+            def prevK:int 0
+            if ((k2 == (0 - dd)) || ((k2 != dd) && ((int_buffer_get Vd ((k2 - 1) + off)) < (int_buffer_get Vd ((k2 + 1) + off))))) {
+                prevK = (k2 + 1)
+            } {
+                prevK = (k2 - 1)
+            }
+            def prevX:int (int_buffer_get Vd (prevK + off))
+            def prevY:int (prevX - prevK)
+            while ((x2 > prevX) && (y2 > prevY)) {
+                x2 = (x2 - 1)
+                y2 = (y2 - 1)
+            }
+            if (prevK == (k2 + 1)) {
+                ; insertion of B[prevY]
+                push kinds 1
+                push xs prevX
+                push ys prevY
+            } {
+                ; deletion of A[prevX]
+                push kinds 0
+                push xs prevX
+                push ys prevY
+            }
+            x2 = prevX
+            y2 = prevY
+            dd = (dd - 1)
+        }
+        ; edits oldest first, joined into hunks
+        def cnt:int (array_length kinds)
+        def i:int (cnt - 1)
+        while (i >= 0) {
+            def ex:int (itemAt xs i)
+            def ey:int (itemAt ys i)
+            if ((itemAt kinds i) == 1) {
+                RdText.addHunk(res (a0 + ex) 0 (b0 + ey) 1)
+            } {
+                RdText.addHunk(res (a0 + ex) 1 (b0 + ey) 0)
+            }
+            i = (i - 1)
+        }
+    }
+
+    ; append a hunk, merging it into the previous one when they touch
+    static sfn addHunk:void (res:RdLineDiff aStart:int aLen:int bStart:int bLen:int) {
+        def n:int (array_length res.hunks)
+        if (n > 0) {
+            def last:RdHunk (itemAt res.hunks (n - 1))
+            if (((last.aStart + last.aLen) == aStart) && ((last.bStart + last.bLen) == bStart)) {
+                last.aLen = (last.aLen + aLen)
+                last.bLen = (last.bLen + bLen)
+                return
+            }
+        }
+        def h (new RdHunk())
+        h.aStart = aStart
+        h.aLen = aLen
+        h.bStart = bStart
+        h.bLen = bLen
+        push res.hunks h
+    }
+
+    ; the classic unified view with `context` lines around each change
+    static sfn unified:string (d:RdLineDiff context:int) {
+        def out:[string]
+        def n:int (array_length d.hunks)
+        def i:int 0
+        while (i < n) {
+            ; group hunks whose context touches
+            def first:RdHunk (itemAt d.hunks i)
+            def j:int i
+            while ((j + 1) < n) {
+                def cur:RdHunk (itemAt d.hunks j)
+                def nxt:RdHunk (itemAt d.hunks (j + 1))
+                if ((nxt.aStart - (cur.aStart + cur.aLen)) > (context * 2)) {
+                    break
+                }
+                j = (j + 1)
+            }
+            def lastH:RdHunk (itemAt d.hunks j)
+            def aFrom:int (first.aStart - context)
+            if (aFrom < 0) {
+                aFrom = 0
+            }
+            def aTo:int ((lastH.aStart + lastH.aLen) + context)
+            if (aTo > (array_length d.a)) {
+                aTo = (array_length d.a)
+            }
+            def bFrom:int (first.bStart - (first.aStart - aFrom))
+            def bTo:int ((lastH.bStart + lastH.bLen) + (aTo - (lastH.aStart + lastH.aLen)))
+            def hdr:string ("@@ -" + (to_string (aFrom + 1)))
+            hdr = ((hdr + ",") + (to_string (aTo - aFrom)))
+            hdr = ((hdr + " +") + (to_string (bFrom + 1)))
+            hdr = ((hdr + ",") + (to_string (bTo - bFrom)))
+            push out (hdr + " @@")
+            def pos:int aFrom
+            def k:int i
+            while (k <= j) {
+                def h:RdHunk (itemAt d.hunks k)
+                while (pos < h.aStart) {
+                    push out (" " + (itemAt d.a pos))
+                    pos = (pos + 1)
+                }
+                def q:int 0
+                while (q < h.aLen) {
+                    push out ("-" + (itemAt d.a (h.aStart + q)))
+                    q = (q + 1)
+                }
+                q = 0
+                while (q < h.bLen) {
+                    push out ("+" + (itemAt d.b (h.bStart + q)))
+                    q = (q + 1)
+                }
+                pos = (h.aStart + h.aLen)
+                k = (k + 1)
+            }
+            while (pos < aTo) {
+                push out (" " + (itemAt d.a pos))
+                pos = (pos + 1)
+            }
+            i = (j + 1)
+        }
+        return (join out "\n")
+    }
+
+    ; ------------------------------------------------------------- diff3
+
+    static sfn merge3:RdMerge (baseText:string mineText:string theirsText:string) {
+        def base:[string] (RdText.lines(baseText))
+        def mine:[string] (RdText.lines(mineText))
+        def theirs:[string] (RdText.lines(theirsText))
+        def dm:RdLineDiff (RdText.diffLines(base mine))
+        def dt:RdLineDiff (RdText.diffLines(base theirs))
+        def res (new RdMerge())
+        def im:int 0
+        def it:int 0
+        def nm:int (array_length dm.hunks)
+        def nt:int (array_length dt.hunks)
+        ; shift of each side so far (new index - base index)
+        def shiftM:int 0
+        def shiftT:int 0
+        def pos:int 0
+        def clean:[string]
+        while ((im < nm) || (it < nt)) {
+            ; the earliest hunk starts a group
+            def gStart:int 0
+            def takeMine:boolean false
+            if (im < nm) {
+                takeMine = true
+                if (it < nt) {
+                    def hm0:RdHunk (itemAt dm.hunks im)
+                    def ht0:RdHunk (itemAt dt.hunks it)
+                    if (ht0.aStart < hm0.aStart) {
+                        takeMine = false
+                    }
+                }
+            }
+            if takeMine {
+                def g1:RdHunk (itemAt dm.hunks im)
+                gStart = g1.aStart
+            } {
+                def g2:RdHunk (itemAt dt.hunks it)
+                gStart = g2.aStart
+            }
+            ; unchanged base lines before the group
+            while (pos < gStart) {
+                push clean (itemAt base pos)
+                pos = (pos + 1)
+            }
+            def gEnd:int gStart
+            def jm:int im
+            def jt:int it
+            def usedM:boolean false
+            def usedT:boolean false
+            if takeMine {
+                def hm1:RdHunk (itemAt dm.hunks im)
+                gEnd = (hm1.aStart + hm1.aLen)
+                jm = (jm + 1)
+                usedM = true
+            } {
+                def ht1:RdHunk (itemAt dt.hunks it)
+                gEnd = (ht1.aStart + ht1.aLen)
+                jt = (jt + 1)
+                usedT = true
+            }
+            def grow:boolean true
+            while grow {
+                grow = false
+                if (jm < nm) {
+                    def hm:RdHunk (itemAt dm.hunks jm)
+                    if (((hm.aStart < gEnd) || (hm.aStart == gStart))) {
+                        if ((hm.aStart + hm.aLen) > gEnd) {
+                            gEnd = (hm.aStart + hm.aLen)
+                        }
+                        jm = (jm + 1)
+                        usedM = true
+                        grow = true
+                    }
+                }
+                if (jt < nt) {
+                    def ht:RdHunk (itemAt dt.hunks jt)
+                    if (((ht.aStart < gEnd) || (ht.aStart == gStart))) {
+                        if ((ht.aStart + ht.aLen) > gEnd) {
+                            gEnd = (ht.aStart + ht.aLen)
+                        }
+                        jt = (jt + 1)
+                        usedT = true
+                        grow = true
+                    }
+                }
+            }
+            ; each side's text for base [gStart, gEnd)
+            def mFrom:int (gStart + shiftM)
+            def tFrom:int (gStart + shiftT)
+            def q:int im
+            while (q < jm) {
+                def h:RdHunk (itemAt dm.hunks q)
+                shiftM = (shiftM + (h.bLen - h.aLen))
+                q = (q + 1)
+            }
+            q = it
+            while (q < jt) {
+                def h2:RdHunk (itemAt dt.hunks q)
+                shiftT = (shiftT + (h2.bLen - h2.aLen))
+                q = (q + 1)
+            }
+            def mPart:[string] (RdText.slice(mine mFrom (gEnd + shiftM)))
+            def tPart:[string] (RdText.slice(theirs tFrom (gEnd + shiftT)))
+            if (usedM && (usedT == false)) {
+                RdText.appendAll(clean mPart)
+                res.fromMine = (res.fromMine + 1)
+            } {
+                if (usedT && (usedM == false)) {
+                    RdText.appendAll(clean tPart)
+                    res.fromTheirs = (res.fromTheirs + 1)
+                } {
+                    if ((join mPart "\n") == (join tPart "\n")) {
+                        if ((array_length mPart) == (array_length tPart)) {
+                            RdText.appendAll(clean mPart)
+                        } {
+                            RdText.conflictChunk(res clean (RdText.slice(base gStart gEnd)) mPart tPart)
+                            clean = (RdText.emptyList())
+                        }
+                    } {
+                        RdText.conflictChunk(res clean (RdText.slice(base gStart gEnd)) mPart tPart)
+                        clean = (RdText.emptyList())
+                    }
+                }
+            }
+            pos = gEnd
+            im = jm
+            it = jt
+        }
+        while (pos < (array_length base)) {
+            push clean (itemAt base pos)
+            pos = (pos + 1)
+        }
+        def tail (new RdMergeChunk())
+        tail.lines = clean
+        push res.chunks tail
+        return res
+    }
+
+    static sfn emptyList:[string] () {
+        def out:[string]
+        return out
+    }
+
+    static sfn conflictChunk:void (res:RdMerge clean:[string] b:[string] m:[string] t:[string]) {
+        def before (new RdMergeChunk())
+        before.lines = clean
+        push res.chunks before
+        def c (new RdMergeChunk())
+        c.conflict = true
+        c.base = b
+        c.mine = m
+        c.theirs = t
+        push res.chunks c
+        res.conflicts = (res.conflicts + 1)
+    }
+}
