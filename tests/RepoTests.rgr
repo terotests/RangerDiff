@@ -159,8 +159,37 @@ class RepoTests {
         T.eqStr(mr4.base c0 "fast-forward base")
     }
 
+    ; a version restored and changed again must not make a delta loop
+    sfn restore:void (T:RdTest) {
+        T.start("restore")
+        def R (new RdRepo())
+        def pic:buffer (buffer_read_file "testdata/images" "shot.png")
+        def v1:string (RepoTests.deck(30 ""))
+        def v2:string (RepoTests.deck(30 "second"))
+        def v3:string (RepoTests.deck(30 "third"))
+        def css:string "h2 { color: navy; }"
+        def a:string (R.commitTree((RepoTests.files(R v1 css pic "")) (RepoTests.none()) "t" "d" "2026-10-03T10:00:00Z" "1"))
+        def b:string (R.commitTree((RepoTests.files(R v2 css pic "")) (RepoTests.one(a)) "t" "d" "2026-10-03T10:01:00Z" "2"))
+        def c:string (R.commitTree((RepoTests.files(R v3 css pic "")) (RepoTests.one(b)) "t" "d" "2026-10-03T10:02:00Z" "3"))
+        def d:string (R.commitTree((RepoTests.files(R v1 css pic "")) (RepoTests.one(c)) "t" "d" "2026-10-03T10:03:00Z" "restore 1"))
+        def e:string (R.commitTree((RepoTests.files(R v2 css pic "")) (RepoTests.one(d)) "t" "d" "2026-10-03T10:04:00Z" "restore 2"))
+        def f:string (R.commitTree((RepoTests.files(R v3 css pic "")) (RepoTests.one(e)) "t" "d" "2026-10-03T10:05:00Z" "restore 3"))
+        T.eqStr((R.fileText(a "deck.md")) v1 "v1")
+        T.eqStr((R.fileText(b "deck.md")) v2 "v2")
+        T.eqStr((R.fileText(c "deck.md")) v3 "v3")
+        T.eqStr((R.fileText(d "deck.md")) v1 "v1 restored")
+        T.eqStr((R.fileText(e "deck.md")) v2 "v2 restored")
+        T.eqStr((R.fileText(f "deck.md")) v3 "v3 restored")
+        ; a blob stored under the id the host computed
+        def R3 (new RdRepo())
+        def known:string (RdSha256.hash(pic))
+        T.eqStr((R3.putBlobId(known pic)) (R.putBlob(pic)) "putBlobId keeps the id")
+        T.ok((RdBytes.equal((R3.read(known)) pic)) "and the bytes")
+    }
+
     sfn main:void () {
         def T (new RdTest())
+        RepoTests.restore(T)
         RepoTests.history(T)
         RepoTests.merging(T)
         T.done()
