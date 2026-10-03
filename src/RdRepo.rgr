@@ -304,14 +304,19 @@ class RdRepo {
     }
 
     fn read:buffer (id:string) {
-        if ((has objects id) == false) {
+        return this.readAt(id 0)
+    }
+
+    ; empty when the object or a base is missing, or a chain runs past 64
+    fn readAt:buffer (id:string depth:int) {
+        if (((has objects id) == false) || (depth > 64)) {
             return (buffer_alloc 0)
         }
         def s:RdStored (unwrap (get objects id))
         if (s.kind == 0) {
             return s.data
         }
-        def baseBytes:buffer (this.read(s.base))
+        def baseBytes:buffer (this.readAt(s.base (depth + 1)))
         def r:RdApplyResult (RdSmart.apply(baseBytes s.data))
         return r.data
     }
@@ -322,6 +327,18 @@ class RdRepo {
 
     fn putBlob:string (data:buffer) {
         def id:string (RdSha256.hash(data))
+        if ((has objects id) == false) {
+            def s (new RdStored())
+            s.id = id
+            s.data = data
+            this.put(s)
+        }
+        return id
+    }
+
+    ; a blob whose SHA-256 the host computed already (crypto.subtle is much
+    ; faster than this library's own hash in a browser); the id is trusted
+    fn putBlobId:string (id:string data:buffer) {
         if ((has objects id) == false) {
             def s (new RdStored())
             s.id = id
@@ -345,9 +362,23 @@ class RdRepo {
         if (old.kind != 0) {
             return
         }
-        ; the new one must not depend on the old one, and the chain stays short
-        if ((nw.base == oldId) || (nw.depth >= maxChain)) {
+        ; the new one must not depend on the old one (anywhere down its
+        ; chain: a version restored and changed again would make a loop),
+        ; and the chain stays short
+        if (nw.depth >= maxChain) {
             return
+        }
+        def cur:RdStored nw
+        def steps:int 0
+        while ((cur.kind == 1) && (steps <= maxChain)) {
+            if (cur.base == oldId) {
+                return
+            }
+            if ((has objects cur.base) == false) {
+                return
+            }
+            cur = (unwrap (get objects cur.base))
+            steps = (steps + 1)
         }
         def oldBytes:buffer old.data
         def newBytes:buffer (this.read(newId))

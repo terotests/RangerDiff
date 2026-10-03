@@ -4757,14 +4757,17 @@ export class RdRepo  {
     return out;
   };
   read (id) {
-    if ( ( typeof(this.objects[id] ) != "undefined" && Object.prototype.hasOwnProperty.call(this.objects, id) ) == false ) {
+    return this.readAt(id, 0);
+  };
+  readAt (id, depth) {
+    if ( ( typeof(this.objects[id] ) != "undefined" && Object.prototype.hasOwnProperty.call(this.objects, id) ) == false || depth > 64 ) {
       return (function(b){ return Object.assign(b, { _view: new DataView(b) }); })(new ArrayBuffer(0));
     }
     const s = ( Object.prototype.hasOwnProperty.call(this.objects, id) ? this.objects[id] : undefined );
     if ( s.kind == 0 ) {
       return s.data;
     }
-    const baseBytes = this.read(s.base);
+    const baseBytes = this.readAt(s.base, (depth + 1));
     const r = RdSmart.apply(baseBytes, s.data);
     return r.data;
   };
@@ -4773,6 +4776,15 @@ export class RdRepo  {
   };
   putBlob (data) {
     const id = RdSha256.hash(data);
+    if ( ( typeof(this.objects[id] ) != "undefined" && Object.prototype.hasOwnProperty.call(this.objects, id) ) == false ) {
+      const s = new RdStored();
+      s.id = id;
+      s.data = data;
+      this.put(s);
+    }
+    return id;
+  };
+  putBlobId (id, data) {
     if ( ( typeof(this.objects[id] ) != "undefined" && Object.prototype.hasOwnProperty.call(this.objects, id) ) == false ) {
       const s = new RdStored();
       s.id = id;
@@ -4793,9 +4805,21 @@ export class RdRepo  {
     if ( old.kind != 0 ) {
       return;
     }
-    if ( nw.base == oldId || nw.depth >= this.maxChain ) {
+    if ( nw.depth >= this.maxChain ) {
       return;
     }
+    let cur = nw;
+    let steps = 0;
+    while (cur.kind == 1 && steps <= this.maxChain) {
+      if ( cur.base == oldId ) {
+        return;
+      }
+      if ( ( typeof(this.objects[cur.base] ) != "undefined" && Object.prototype.hasOwnProperty.call(this.objects, cur.base) ) == false ) {
+        return;
+      }
+      cur = ( Object.prototype.hasOwnProperty.call(this.objects, cur.base) ? this.objects[cur.base] : undefined );
+      steps = steps + 1;
+    };
     const oldBytes = old.data;
     const newBytes = this.read(newId);
     let d = RdSmart.diff(newBytes, oldBytes);
