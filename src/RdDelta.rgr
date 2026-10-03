@@ -260,14 +260,40 @@ class RdDelta {
                 cand = (int_buffer_get next (cand - 1))
                 tries = (tries + 1)
             }
-            if (bestOff >= 0) {
-                if ((bestOff == lastEnd) && (bestBack == 0)) {
-                    bestBack = (RdDelta.backward(base bestOff target t lit))
+            ; resync after an edit: repetitive data (XML) has the same
+            ; block in many places, and a copy from somewhere else can win at
+            ; t although the edited file continues right after the previous
+            ; COPY. Try base [lastEnd, lastEnd+48) against target [t, t+16)
+            def bestT:int t
+            if (((lastEnd >= 0) && ((t - lit) < 64)) && (bestFwd < 4096)) {
+                def gain:int (bestFwd + bestBack)
+                def k2:int 0
+                while ((k2 < 16) && ((t + k2) < end)) {
+                    def j2:int 0
+                    while ((j2 < 48) && ((lastEnd + j2) < bl)) {
+                        if ((buffer_get base (lastEnd + j2)) == (buffer_get target (t + k2))) {
+                            def f2:int (RdDelta.forward(base (lastEnd + j2) target (t + k2) end))
+                            if ((f2 >= B) && ((f2 - k2) > gain)) {
+                                gain = (f2 - k2)
+                                bestOff = (lastEnd + j2)
+                                bestFwd = f2
+                                bestBack = 0
+                                bestT = (t + k2)
+                            }
+                        }
+                        j2 = (j2 + 1)
+                    }
+                    k2 = (k2 + 1)
                 }
-                def from:int (t - bestBack)
+            }
+            if (bestOff >= 0) {
+                if (bestBack == 0) {
+                    bestBack = (RdDelta.backward(base bestOff target bestT lit))
+                }
+                def from:int (bestT - bestBack)
                 w.add(target lit (from - lit))
                 w.copy((bestOff - bestBack) (bestFwd + bestBack))
-                t = (t + bestFwd)
+                t = (bestT + bestFwd)
                 lit = t
                 lastEnd = (bestOff + bestFwd)
                 fresh = true

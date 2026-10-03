@@ -1,0 +1,114 @@
+; SPDX-License-Identifier: MIT
+; ZIP read/write and the segmented XLSX delta, on the files in testdata/xlsx.
+; Run from the repository root.
+
+Import "../src/RdPack.rgr"
+Import "RdTest.rgr"
+
+class PackTests {
+
+    sfn load:buffer (name:string) {
+        return (buffer_read_file "testdata/xlsx" name)
+    }
+
+    ; every part of a equals the part of the same name in b
+    sfn sameParts:boolean (a:buffer b:buffer) {
+        def za:RdZipArchive (RdZip.read(a))
+        def zb:RdZipArchive (RdZip.read(b))
+        if ((za.ok == false) || (zb.ok == false)) {
+            return false
+        }
+        if ((array_length za.entries) != (array_length zb.entries)) {
+            return false
+        }
+        def i:int 0
+        while (i < (array_length za.entries)) {
+            def ea:RdZipEntry (itemAt za.entries i)
+            def eb:RdZipEntry (itemAt zb.entries i)
+            if (ea.name != eb.name) {
+                return false
+            }
+            if ((RdBytes.equal((ea.content()) (eb.content()))) == false) {
+                return false
+            }
+            i = (i + 1)
+        }
+        return true
+    }
+
+    sfn zip:void (T:RdTest) {
+        T.start("zip")
+        def b:buffer (PackTests.load("base.xlsx"))
+        def z:RdZipArchive (RdZip.read(b))
+        T.ok(z.ok ("reads base.xlsx " + z.error))
+        T.ok(((array_length z.entries) >= 9) "has the parts of a workbook")
+        def sheet@(optional):RdZipEntry (z.find("xl/worksheets/sheet1.xml"))
+        T.ok((!null? sheet) "has sheet1.xml")
+        if (!null? sheet) {
+            def s:RdZipEntry (unwrap sheet)
+            def xml:buffer s.content()
+            T.eqInt((buffer_length xml) s.usize "inflated size")
+            T.eqInt((RdZip.crc32(xml)) s.crc "crc32 of the content")
+            T.ok(((indexOf (RdBytes.toText(xml)) "<sheetData>") > 0) "it is sheet XML")
+        }
+        ; written back, every part is the same
+        def again:buffer (RdZip.write(z.entries))
+        T.ok((PackTests.sameParts(b again)) "rewritten archive has the same parts")
+        ; a stored archive reads back too
+        def stored:[RdZipEntry]
+        for z.entries e:RdZipEntry i {
+            push stored (RdZipEntry.stored(e.name (e.content())))
+        }
+        def st:buffer (RdZip.write(stored))
+        T.ok((PackTests.sameParts(b st)) "stored archive has the same parts")
+        def bad:RdZipArchive (RdZip.read((RdBytes.fromText("hello"))))
+        T.ok((bad.ok == false) "not a zip is refused")
+    }
+
+    sfn edit:void (T:RdTest name:string maxDelta:int) {
+        T.start(("xlsx " + name))
+        def base:buffer (PackTests.load("base.xlsx"))
+        def target:buffer (PackTests.load(name))
+        def d:buffer (RdPack.diff(base target))
+        T.ok((RdPack.isPackDelta(d)) "is a segmented delta")
+        def r:RdApplyResult (RdPack.apply(base d))
+        T.ok(r.ok ("applies " + r.error))
+        T.ok((PackTests.sameParts(target r.data)) "rebuilt workbook has the new parts")
+        T.ok(((buffer_length d) <= maxDelta) ((("delta " + (to_string (buffer_length d))) + " bytes, at most ") + (to_string maxDelta)))
+        def info:RdPackInfo (RdPack.info(base d))
+        T.ok(info.ok "info reads")
+        def changed:[RdPartChange] (info.changed())
+        T.ok(((array_length changed) >= 1) "something changed")
+        ; and back: the reverse delta rebuilds the base parts
+        def back:buffer (RdPack.diff(r.data base))
+        def r2:RdApplyResult (RdPack.apply(r.data back))
+        T.ok((r2.ok && (PackTests.sameParts(base r2.data))) "reverse delta gives the base")
+    }
+
+    sfn damage:void (T:RdTest) {
+        T.start("xlsx damage")
+        def base:buffer (PackTests.load("base.xlsx"))
+        def target:buffer (PackTests.load("edit-cell.xlsx"))
+        def d:buffer (RdPack.diff(base target))
+        def other:buffer (PackTests.load("add-sheet.xlsx"))
+        def r:RdApplyResult (RdPack.apply(other d))
+        T.ok((r.ok == false) "a different base is refused")
+        def cut:buffer (buffer_slice d 0 ((buffer_length d) - 2))
+        def r2:RdApplyResult (RdPack.apply(base cut))
+        T.ok((r2.ok == false) "a truncated delta is refused")
+    }
+
+    sfn main:void () {
+        def T (new RdTest())
+        PackTests.zip(T)
+        PackTests.edit(T "edit-cell.xlsx" 400)
+        PackTests.edit(T "edit-row.xlsx" 600)
+        PackTests.edit(T "insert-rows.xlsx" 6000)
+        PackTests.edit(T "delete-rows.xlsx" 600)
+        PackTests.edit(T "add-sheet.xlsx" 8000)
+        PackTests.edit(T "style-header.xlsx" 1500)
+        PackTests.edit(T "edit-column.xlsx" 16000)
+        PackTests.damage(T)
+        T.done()
+    }
+}
