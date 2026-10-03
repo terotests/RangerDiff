@@ -1,0 +1,63 @@
+; SPDX-License-Identifier: MIT
+
+; ============================================================================
+; RdSmart.rgr — one diff/apply for every file: the right delta for its kind
+; ============================================================================
+; ZIP containers (XLSX, DOCX, PPTX) get the segmented delta (RdPack), PNG the
+; pixel delta (RdPng), everything else the byte delta (RdDelta). The segmented
+; form is used only when it is clearly smaller (under 80 %) than the plain byte
+; delta, because only the byte delta rebuilds the file byte for byte.
+;
+; JPEG and other compressed photos: a byte delta of a re-encoded photo is
+; about as large as the photo. Keep the original once and the edit as a
+; recipe (see RdRecipe) instead.
+; ============================================================================
+
+Import "RdPack.rgr"
+Import "RdPng.rgr"
+
+class RdSmart {
+
+    ; 1 bytes, 2 container, 3 png; 0 not a RangerDiff delta
+    static sfn kindOf:int (d:buffer) {
+        if ((buffer_length d) < 4) {
+            return 0
+        }
+        if ((((buffer_get d 0) != 82) || ((buffer_get d 1) != 68)) || ((buffer_get d 2) != 1)) {
+            return 0
+        }
+        return (buffer_get d 3)
+    }
+
+    static sfn diff:buffer (base:buffer target:buffer) {
+        def plain:buffer (RdDelta.diff(base target))
+        def smart:buffer plain
+        if ((RdZip.isZip(base)) && (RdZip.isZip(target))) {
+            smart = (RdPack.diff(base target))
+        } {
+            if ((RdPng.isPng(base)) && (RdPng.isPng(target))) {
+                smart = (RdPng.diff(base target))
+            }
+        }
+        if (((buffer_length smart) * 5) < ((buffer_length plain) * 4)) {
+            return smart
+        }
+        return plain
+    }
+
+    static sfn apply:RdApplyResult (base:buffer delta:buffer) {
+        def k:int (RdSmart.kindOf(delta))
+        if (k == 2) {
+            return (RdPack.apply(base delta))
+        }
+        if (k == 3) {
+            return (RdPng.apply(base delta))
+        }
+        return (RdDelta.apply(base delta))
+    }
+
+    ; true when apply gives the file byte for byte (not only the same content)
+    static sfn exact:boolean (delta:buffer) {
+        return ((RdSmart.kindOf(delta)) == 1)
+    }
+}

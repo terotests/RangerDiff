@@ -1,0 +1,151 @@
+; SPDX-License-Identifier: MIT
+; Delta sizes and speed for typical edits of real files. Prints one JSON line
+; per scenario; bench/report.mjs turns them into BENCHMARK.md.
+; Run from the repository root.
+
+Import "../src/RdRepo.rgr"
+Import "../tests/RdTest.rgr"
+
+class Bench {
+
+    sfn esc:string (s:string) {
+        return (replace (replace s "\\" "\\\\") "\"" "\\\"")
+    }
+
+    ; diff `rounds` times, apply once; print sizes and times
+    sfn run:void (group:string name:string base:buffer target:buffer) {
+        def rounds:int 1
+        if (((buffer_length base) + (buffer_length target)) < 200000) {
+            rounds = 10
+        }
+        def t0:double (wall_clock_ms)
+        def d:buffer (buffer_alloc 0)
+        def i:int 0
+        while (i < rounds) {
+            d = (RdSmart.diff(base target))
+            i = (i + 1)
+        }
+        def t1:double (wall_clock_ms)
+        def r:RdApplyResult (RdSmart.apply(base d))
+        def t2:double (wall_clock_ms)
+        def plain:buffer (RdDelta.diff(base target))
+        def kinds:[string] ([] _:string ("?" "bytes" "container" "png"))
+        def k:int (RdSmart.kindOf(d))
+        def kn:string "?"
+        if ((k >= 0) && (k < 4)) {
+            kn = (itemAt kinds k)
+        }
+        def line:string ("{\"group\":\"" + (Bench.esc(group)) + "\",\"name\":\"" + (Bench.esc(name)) + "\"")
+        line = (line + ",\"base\":" + (to_string (buffer_length base)) + ",\"new\":" + (to_string (buffer_length target)))
+        line = (line + ",\"delta\":" + (to_string (buffer_length d)) + ",\"plain\":" + (to_string (buffer_length plain)))
+        line = (line + ",\"kind\":\"" + kn + "\",\"ok\":" + (to_string r.ok))
+        line = (line + ",\"diffMs\":" + (to_string ((t1 - t0) / (to_double rounds))) + ",\"applyMs\":" + (to_string (t2 - t1)) + "}")
+        print line
+    }
+
+    sfn text:string (dir:string name:string) {
+        return (RdBytes.toText((buffer_read_file dir name)))
+    }
+
+    sfn md:void () {
+        def deck:string (Bench.text("testdata/md" "raportti.md"))
+        def long:string ((((Bench.text("testdata/md" "raportti.md")) + "\n\n") + ((Bench.text("testdata/md" "esittely.md")) + "\n\n")) + (Bench.text("testdata/md" "talous.en.md")))
+        def b:buffer (RdBytes.fromText(deck))
+        Bench.run("markdown" "typo fixed (raportti.md)" b (RdBytes.fromText((replace deck "kasvoi" "kasvoi selvästi"))))
+        Bench.run("markdown" "front matter title changed" b (RdBytes.fromText((replace deck "Neljännesvuosiraportti Q4" "Vuosiraportti 2026"))))
+        def lb:buffer (RdBytes.fromText(long))
+        def slide:string "\n## Uusi dia\n\n- ensimmäinen kohta\n- toinen kohta\n- kolmas kohta\n"
+        def mid:int (idiv (strlen long) 2)
+        def nl:int (indexOf (substring long mid (strlen long)) "\n## ")
+        def at:int (mid + nl)
+        def withSlide:string (((substring long 0 at) + slide) + (substring long at (strlen long)))
+        Bench.run("markdown" "slide added in the middle (3 decks)" lb (RdBytes.fromText(withSlide)))
+        def nl2:int (indexOf (substring long (at + 4) (strlen long)) "\n## ")
+        def end2:int ((at + 4) + nl2)
+        def without:string ((substring long 0 at) + (substring long end2 (strlen long)))
+        Bench.run("markdown" "slide deleted (3 decks)" lb (RdBytes.fromText(without)))
+        def moved:string (((substring long 0 at) + (substring long end2 (strlen long))) + (substring long at end2))
+        Bench.run("markdown" "slide moved to the end (3 decks)" lb (RdBytes.fromText(moved)))
+        Bench.run("markdown" "all text replaced" lb (RdBytes.fromText((replace (replace (replace long "a" "4") "e" "3") "i" "1"))))
+    }
+
+    sfn xlsx:void () {
+        def base:buffer (buffer_read_file "testdata/xlsx" "base.xlsx")
+        def names:[string] ([] _:string ("edit-cell.xlsx" "edit-row.xlsx" "edit-column.xlsx" "insert-rows.xlsx" "delete-rows.xlsx" "add-sheet.xlsx" "style-header.xlsx"))
+        for names n:string i {
+            Bench.run("xlsx (2000 rows, 3 sheets)" n base (buffer_read_file "testdata/xlsx" n))
+        }
+    }
+
+    sfn images:void () {
+        def jpg:buffer (buffer_read_file "testdata/images" "photo.jpg")
+        Bench.run("photo (JPEG 1600x1067)" "brightness +15 %, re-encoded" jpg (buffer_read_file "testdata/images" "photo-brighter.jpg"))
+        Bench.run("photo (JPEG 1600x1067)" "cropped, re-encoded" jpg (buffer_read_file "testdata/images" "photo-cropped.jpg"))
+        Bench.run("photo (JPEG 1600x1067)" "saved again unchanged" jpg (buffer_read_file "testdata/images" "photo-resaved.jpg"))
+        def png:buffer (buffer_read_file "testdata/images" "shot.png")
+        Bench.run("screenshot (PNG 1280x800)" "rectangle drawn" png (buffer_read_file "testdata/images" "shot-annotated.png"))
+        Bench.run("screenshot (PNG 1280x800)" "text changed" png (buffer_read_file "testdata/images" "shot-text.png"))
+    }
+
+    sfn binary:void () {
+        def R (new RdRandom(2026))
+        def big:buffer R.bytes(4000000)
+        def w (new RdWriter())
+        w.bytes(big 0 1000000)
+        w.all((R.bytes(300)))
+        w.bytes(big 1000000 1500000)
+        w.bytes(big 2600000 1400000)
+        Bench.run("binary (4 MB)" "300 bytes inserted, 100 kB deleted" big (w.toBuffer()))
+        def h (new RdWriter())
+        h.all((R.bytes(4096)))
+        h.all(big)
+        Bench.run("binary (4 MB)" "4 kB header added" big (h.toBuffer()))
+    }
+
+    ; a deck edited 50 times: what the history costs
+    sfn history:void () {
+        def R (new RdRepo())
+        def deck:string ((((Bench.text("testdata/md" "raportti.md")) + "\n\n") + ((Bench.text("testdata/md" "esittely.md")) + "\n\n")) + (Bench.text("testdata/md" "talous.en.md")))
+        def pic:buffer (buffer_read_file "testdata/images" "shot.png")
+        def head:string ""
+        def fullTotal:int 0
+        def k:int 0
+        def t0:double (wall_clock_ms)
+        while (k < 50) {
+            deck = (deck + ("\nEdit " + (to_string k)))
+            def t (new RdTree())
+            push t.entries (R.entryOf("deck.md" (RdBytes.fromText(deck)) ""))
+            def recipe:string ""
+            if (k > 25) {
+                recipe = ("{\"bright\":" + (to_string k) + "}")
+            }
+            push t.entries (R.entryOf("media/shot.png" pic recipe))
+            def parents:[string]
+            if ((strlen head) > 0) {
+                push parents head
+            }
+            def tm:string ("2026-10-03T10:" + (to_string (10 + k)) + ":00Z")
+            head = (R.commitTree(t parents "bench" "laptop" tm ("Edit " + (to_string k))))
+            fullTotal = (fullTotal + ((strlen deck) + (buffer_length pic)))
+            k = (k + 1)
+        }
+        def t1:double (wall_clock_ms)
+        def lg:[RdCommit] (R.log(head 100))
+        def first:RdCommit (itemAt lg 49)
+        def t2:double (wall_clock_ms)
+        def oldest:string (R.fileText(first.id "deck.md"))
+        def t3:double (wall_clock_ms)
+        def line:string ("{\"group\":\"history\",\"name\":\"deck + picture, 50 commits\",\"full\":" + (to_string fullTotal))
+        line = (line + ",\"stored\":" + (to_string (R.storedBytes())) + ",\"commitMs\":" + (to_string ((t1 - t0) / 50.0)))
+        line = (line + ",\"restoreOldestMs\":" + (to_string (t3 - t2)) + ",\"ok\":" + (to_string ((strlen oldest) > 0)) + "}")
+        print line
+    }
+
+    sfn main:void () {
+        Bench.md()
+        Bench.xlsx()
+        Bench.images()
+        Bench.binary()
+        Bench.history()
+    }
+}

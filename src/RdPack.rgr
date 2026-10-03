@@ -16,6 +16,9 @@
 ;       3 RENAMED  text base name, unchanged content
 ;       5 SHEET    varint len · a byte delta between the row-relative forms
 ;                  (RdXlsx) of the base worksheet and the new one
+;       6 RAW      byte method · varint usize · varint len · the part as the
+;                  new archive stores it (compressed): for a new part, or when
+;                  that is smaller than a delta
 ;
 ; A SAME part is written back with the base archive's compressed bytes; a
 ; DELTA or FULL part is written stored. The rebuilt archive has every part
@@ -125,7 +128,7 @@ class RdPack {
                     } {
                         d = (RdDelta.diff((o.content()) nb))
                     }
-                    if ((buffer_length d) < (buffer_length nb)) {
+                    if ((buffer_length d) < (buffer_length e.raw)) {
                         if sheetForm {
                             w.byte(5)
                         } {
@@ -134,9 +137,7 @@ class RdPack {
                         w.varint((buffer_length d))
                         w.all(d)
                     } {
-                        w.byte(2)
-                        w.varint((buffer_length nb))
-                        w.all(nb)
+                        RdPack.writeRaw(w e)
                     }
                 }
             } {
@@ -145,14 +146,19 @@ class RdPack {
                     w.byte(3)
                     w.text((unwrap (get byCrc key2)))
                 } {
-                    def nb2:buffer (e.content())
-                    w.byte(2)
-                    w.varint((buffer_length nb2))
-                    w.all(nb2)
+                    RdPack.writeRaw(w e)
                 }
             }
         }
         return w.toBuffer()
+    }
+
+    static sfn writeRaw:void (w:RdWriter e:RdZipEntry) {
+        w.byte(6)
+        w.byte(e.method)
+        w.varint(e.usize)
+        w.varint((buffer_length e.raw))
+        w.all(e.raw)
     }
 
     static sfn isPackDelta:boolean (d:buffer) {
@@ -184,6 +190,27 @@ class RdPack {
             if rd.failed {
                 res.error = "delta is truncated"
                 return res
+            }
+            if (kind == 6) {
+                def re (new RdZipEntry())
+                re.name = name
+                re.method = rd.byte()
+                re.usize = rd.varint()
+                def rlen:int rd.varint()
+                re.raw = rd.bytes(rlen)
+                re.csize = rlen
+                re.crc = crc
+                if rd.failed {
+                    res.error = "delta is truncated"
+                    return res
+                }
+                if ((RdZip.crc32((re.content()))) != crc) {
+                    res.error = ("part does not match its checksum: " + name)
+                    return res
+                }
+                push out re
+                i = (i + 1)
+                continue
             }
             if ((kind == 0) || (kind == 3)) {
                 def baseName:string name
@@ -292,6 +319,13 @@ class RdPack {
                 def flen:int rd.varint()
                 rd.bytes(flen)
                 c.newSize = flen
+            }
+            if (c.kind == 6) {
+                rd.byte()
+                c.newSize = rd.varint()
+                rd.bytes(rd.varint())
+                ; shown as added / replaced
+                c.kind = 2
             }
             if (c.kind == 3) {
                 c.baseName = rd.text()

@@ -1,0 +1,892 @@
+; SPDX-License-Identifier: MIT
+
+; ============================================================================
+; RdRepo.rgr — versions as commits, like git, over a store the host keeps
+; ============================================================================
+;
+;   blob    a file's bytes; id = SHA-256 of the bytes
+;   tree    the files of one version: path → blob id (+ an optional recipe,
+;           e.g. the edits of a picture kept as the original + "bright=20")
+;   commit  tree, parents (0 first, 1 normal, 2 a merge), author, device,
+;           time, message; id = SHA-256 of its text
+;
+; Storage: a blob is stored whole or as a delta against another blob. When a
+; commit changes a file, the previous version of that file is turned into a
+; reverse delta against the new one (when that is clearly smaller): the newest
+; version stays whole and quick to open, history costs only its changes. A
+; chain is cut at MAXCHAIN deltas by keeping a version whole.
+;
+; The host persists `stored(id)` for each id `takeDirty()` returns, and gives
+; them back with `load(bytes)`. Trees and commits are small text objects.
+; ============================================================================
+
+Import "RdSha256.rgr"
+Import "RdSmart.rgr"
+Import "RdText.rgr"
+
+class RdEntry {
+    def path:string ""
+    def blob:string ""
+    def size:int 0
+    ; "" or the edits of a derived file (JSON, the host's own format)
+    def recipe:string ""
+
+    Constructor () {
+    }
+}
+
+class RdTree {
+    def entries:[RdEntry]
+
+    Constructor () {
+    }
+
+    fn find@(optional):RdEntry (path:string) {
+        def found@(optional):RdEntry
+        for entries e:RdEntry i {
+            if (e.path == path) {
+                found = e
+                break
+            }
+        }
+        return found
+    }
+
+    fn text:string () {
+        def lines:[string]
+        for entries e:RdEntry i {
+            def l:string ((((e.path + "\t") + e.blob) + "\t") + (to_string e.size))
+            if ((strlen e.recipe) > 0) {
+                l = ((l + "\t") + e.recipe)
+            }
+            push lines l
+        }
+        return (join lines "\n")
+    }
+
+    sfn parse:RdTree (s:string) {
+        def t (new RdTree())
+        if ((strlen s) == 0) {
+            return t
+        }
+        def lines:[string] (strsplit s "\n")
+        for lines l:string i {
+            def f:[string] (strsplit l "\t")
+            if ((array_length f) >= 3) {
+                def e (new RdEntry())
+                e.path = (itemAt f 0)
+                e.blob = (itemAt f 1)
+                e.size = (RdRepo.toInt((itemAt f 2)))
+                if ((array_length f) >= 4) {
+                    ; a recipe may hold tabs of its own
+                    def rest:[string] (RdText.slice(f 3 (array_length f)))
+                    e.recipe = (join rest "\t")
+                }
+                push t.entries e
+            }
+        }
+        return t
+    }
+}
+
+class RdCommit {
+    def id:string ""
+    def tree:string ""
+    def parents:[string]
+    def author:string ""
+    def device:string ""
+    def time:string ""
+    def message:string ""
+
+    Constructor () {
+    }
+
+    fn text:string () {
+        def lines:[string]
+        push lines ("tree " + tree)
+        for parents p:string i {
+            push lines ("parent " + p)
+        }
+        push lines ("author " + author)
+        push lines ("device " + device)
+        push lines ("time " + time)
+        push lines ""
+        push lines message
+        return (join lines "\n")
+    }
+
+    sfn parse:RdCommit (id:string s:string) {
+        def c (new RdCommit())
+        c.id = id
+        def lines:[string] (strsplit s "\n")
+        def i:int 0
+        def n:int (array_length lines)
+        while (i < n) {
+            def l:string (itemAt lines i)
+            if ((strlen l) == 0) {
+                def rest:[string] (RdText.slice(lines (i + 1) n))
+                c.message = (join rest "\n")
+                break
+            }
+            def sp:int (indexOf l " ")
+            def key:string (substring l 0 sp)
+            def val:string (substring l (sp + 1) (strlen l))
+            if (key == "tree") {
+                c.tree = val
+            }
+            if (key == "parent") {
+                push c.parents val
+            }
+            if (key == "author") {
+                c.author = val
+            }
+            if (key == "device") {
+                c.device = val
+            }
+            if (key == "time") {
+                c.time = val
+            }
+            i = (i + 1)
+        }
+        return c
+    }
+}
+
+; one stored object: whole, or a delta against another object
+class RdStored {
+    def id:string ""
+    ; 0 whole, 1 delta
+    def kind:int 0
+    def base:string ""
+    def data:buffer (buffer_alloc 0)
+    ; deltas between this and a whole object
+    def depth:int 0
+
+    Constructor () {
+    }
+
+    fn encode:buffer () {
+        def w (new RdWriter())
+        w.byte(82)
+        w.byte(79)
+        w.byte(1)
+        w.byte(kind)
+        w.text(id)
+        w.text(base)
+        w.varint(depth)
+        w.varint((buffer_length data))
+        w.all(data)
+        return w.toBuffer()
+    }
+
+    sfn decode@(optional):RdStored (b:buffer) {
+        def none@(optional):RdStored
+        def rd (new RdReader(b))
+        if ((rd.byte()) != 82) {
+            return none
+        }
+        if ((rd.byte()) != 79) {
+            return none
+        }
+        if ((rd.byte()) != 1) {
+            return none
+        }
+        def s (new RdStored())
+        s.kind = rd.byte()
+        s.id = rd.text()
+        s.base = rd.text()
+        s.depth = rd.varint()
+        def n:int rd.varint()
+        s.data = rd.bytes(n)
+        if rd.failed {
+            return none
+        }
+        def out@(optional):RdStored s
+        return out
+    }
+}
+
+class RdFileChange {
+    def path:string ""
+    ; "added", "removed", "changed", "recipe" (only the recipe changed)
+    def kind:string ""
+    def oldBlob:string ""
+    def newBlob:string ""
+    def oldSize:int 0
+    def newSize:int 0
+    def oldRecipe:string ""
+    def newRecipe:string ""
+    ; text files: lines
+    def added:int 0
+    def removed:int 0
+
+    Constructor () {
+    }
+}
+
+class RdFileMerge {
+    def path:string ""
+    ; "same", "mine", "theirs", "merged", "conflict"
+    def result:string ""
+    def text:boolean false
+    def merge@(optional):RdMerge
+    ; the entry that is used when this is not a conflict
+    def entry@(optional):RdEntry
+    def mine@(optional):RdEntry
+    def theirs@(optional):RdEntry
+
+    Constructor () {
+    }
+}
+
+class RdRepoMerge {
+    def base:string ""
+    def mine:string ""
+    def theirs:string ""
+    def files:[RdFileMerge]
+    def conflicts:int 0
+
+    Constructor () {
+    }
+}
+
+class RdRepo {
+    def objects:[string:RdStored]
+    ; (see the end of the class for helpers)
+    def dirty:[string]
+    def maxChain:int 16
+
+    Constructor () {
+    }
+
+    ; ------------------------------------------------------------ storage
+
+    fn has:boolean (id:string) {
+        return (has objects id)
+    }
+
+    fn put:void (s:RdStored) {
+        (set objects s.id s)
+        push dirty s.id
+    }
+
+    fn load:boolean (bytes:buffer) {
+        def s@(optional):RdStored (RdStored.decode(bytes))
+        if (null? s) {
+            return false
+        }
+        def st:RdStored (unwrap s)
+        (set objects st.id st)
+        return true
+    }
+
+    fn stored:buffer (id:string) {
+        if (has objects id) {
+            def s:RdStored (unwrap (get objects id))
+            return s.encode()
+        }
+        return (buffer_alloc 0)
+    }
+
+    ; the ids stored or changed since the last call
+    fn takeDirty:[string] () {
+        def out:[string]
+        def seen:[string:boolean]
+        for dirty id:string i {
+            if ((has seen id) == false) {
+                (set seen id true)
+                push out id
+            }
+        }
+        def empty:[string]
+        dirty = empty
+        return out
+    }
+
+    fn read:buffer (id:string) {
+        if ((has objects id) == false) {
+            return (buffer_alloc 0)
+        }
+        def s:RdStored (unwrap (get objects id))
+        if (s.kind == 0) {
+            return s.data
+        }
+        def baseBytes:buffer (this.read(s.base))
+        def r:RdApplyResult (RdSmart.apply(baseBytes s.data))
+        return r.data
+    }
+
+    fn readText:string (id:string) {
+        return (RdBytes.toText((this.read(id))))
+    }
+
+    fn putBlob:string (data:buffer) {
+        def id:string (RdSha256.hash(data))
+        if ((has objects id) == false) {
+            def s (new RdStored())
+            s.id = id
+            s.data = data
+            this.put(s)
+        }
+        return id
+    }
+
+    fn putText:string (s:string) {
+        return this.putBlob((RdBytes.fromText(s)))
+    }
+
+    ; store `oldId` as a delta against `newId` when that is clearly smaller
+    fn deltify:void (oldId:string newId:string) {
+        if ((oldId == newId) || (((has objects oldId) == false) || ((has objects newId) == false))) {
+            return
+        }
+        def old:RdStored (unwrap (get objects oldId))
+        def nw:RdStored (unwrap (get objects newId))
+        if (old.kind != 0) {
+            return
+        }
+        ; the new one must not depend on the old one, and the chain stays short
+        if ((nw.base == oldId) || (nw.depth >= maxChain)) {
+            return
+        }
+        def oldBytes:buffer old.data
+        def newBytes:buffer (this.read(newId))
+        def d:buffer (RdSmart.diff(newBytes oldBytes))
+        ; the delta must rebuild the old bytes exactly
+        if ((RdSmart.exact(d)) == false) {
+            def r:RdApplyResult (RdSmart.apply(newBytes d))
+            if ((RdBytes.equal(r.data oldBytes)) == false) {
+                d = (RdDelta.diff(newBytes oldBytes))
+            }
+        }
+        if (((buffer_length d) * 5) >= ((buffer_length oldBytes) * 4)) {
+            return
+        }
+        def s (new RdStored())
+        s.id = oldId
+        s.kind = 1
+        s.base = newId
+        s.depth = (nw.depth + 1)
+        s.data = d
+        this.put(s)
+    }
+
+    ; ------------------------------------------------------------- commits
+
+    fn tree:RdTree (id:string) {
+        return (RdTree.parse((this.readText(id))))
+    }
+
+    fn commit@(optional):RdCommit (id:string) {
+        def none@(optional):RdCommit
+        if ((has objects id) == false) {
+            return none
+        }
+        def c@(optional):RdCommit (RdCommit.parse(id (this.readText(id))))
+        return c
+    }
+
+    ; a new version. `paths`/`datas`/`recipes` are the files (same length;
+    ; a file whose data is empty and whose recipe names a blob is kept as
+    ; that blob: see `entryOf`)
+    fn commitTree:string (t:RdTree parents:[string] author:string device:string time:string message:string) {
+        ; sort by path, so the same files make the same tree
+        def sorted (new RdTree())
+        def paths:[string]
+        for t.entries e:RdEntry i {
+            push paths e.path
+        }
+        def sortedPaths:[string] (RdRepo.sortStrings(paths))
+        for sortedPaths p:string j {
+            def e2@(optional):RdEntry (t.find(p))
+            if (!null? e2) {
+                push sorted.entries (unwrap e2)
+            }
+        }
+        def treeId:string (this.putText((sorted.text())))
+        def c (new RdCommit())
+        c.tree = treeId
+        c.parents = parents
+        c.author = author
+        c.device = device
+        c.time = time
+        c.message = message
+        def id:string (this.putText((c.text())))
+        ; history as reverse deltas: each parent's version of a changed file
+        for parents pid:string k {
+            def pc@(optional):RdCommit (this.commit(pid))
+            if (!null? pc) {
+                def pcv:RdCommit (unwrap pc)
+                def pt:RdTree (this.tree(pcv.tree))
+                for sorted.entries ne:RdEntry m {
+                    def oe@(optional):RdEntry (pt.find(ne.path))
+                    if (!null? oe) {
+                        def o:RdEntry (unwrap oe)
+                        if (o.blob != ne.blob) {
+                            this.deltify(o.blob ne.blob)
+                        }
+                    }
+                }
+            }
+        }
+        return id
+    }
+
+    ; a tree entry for `data` at `path`
+    fn entryOf:RdEntry (path:string data:buffer recipe:string) {
+        def e (new RdEntry())
+        e.path = path
+        e.blob = this.putBlob(data)
+        e.size = (buffer_length data)
+        e.recipe = recipe
+        return e
+    }
+
+    ; newest first, every commit reachable from `head` once
+    fn log:[RdCommit] (head:string limit:int) {
+        def out:[RdCommit]
+        def seen:[string:boolean]
+        def queue:[string]
+        push queue head
+        while (((array_length queue) > 0) && ((array_length out) < limit)) {
+            ; take the newest by time
+            def bestI:int 0
+            def bestC@(optional):RdCommit
+            def qi:int 0
+            def bestTime:string ""
+            while (qi < (array_length queue)) {
+                def cid:string (itemAt queue qi)
+                def cc@(optional):RdCommit (this.commit(cid))
+                if (!null? cc) {
+                    def ccv:RdCommit (unwrap cc)
+                    if ((null? bestC) || ((RdRepo.cmp(ccv.time bestTime)) > 0)) {
+                        bestC = ccv
+                        bestTime = ccv.time
+                        bestI = qi
+                    }
+                }
+                qi = (qi + 1)
+            }
+            if (null? bestC) {
+                break
+            }
+            def c:RdCommit (unwrap bestC)
+            (remove_index queue bestI)
+            if ((has seen c.id) == false) {
+                (set seen c.id true)
+                push out c
+                for c.parents p:string i {
+                    if ((has seen p) == false) {
+                        push queue p
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    fn ancestors:[string:boolean] (head:string) {
+        def seen:[string:boolean]
+        def stack:[string]
+        push stack head
+        while ((array_length stack) > 0) {
+            def id:string (itemAt stack ((array_length stack) - 1))
+            (remove_index stack ((array_length stack) - 1))
+            if ((has seen id) == false) {
+                (set seen id true)
+                def c@(optional):RdCommit (this.commit(id))
+                if (!null? c) {
+                    def cpv:RdCommit (unwrap c)
+                    for cpv.parents p:string i {
+                        push stack p
+                    }
+                }
+            }
+        }
+        return seen
+    }
+
+    fn isAncestor:boolean (a:string b:string) {
+        def anc:[string:boolean] (this.ancestors(b))
+        return (has anc a)
+    }
+
+    ; the newest common ancestor of a and b ("" when none)
+    fn mergeBase:string (a:string b:string) {
+        def anc:[string:boolean] (this.ancestors(a))
+        def best:string ""
+        def bestTime:string ""
+        def seen:[string:boolean]
+        def stack:[string]
+        push stack b
+        while ((array_length stack) > 0) {
+            def id:string (itemAt stack ((array_length stack) - 1))
+            (remove_index stack ((array_length stack) - 1))
+            if ((has seen id) == false) {
+                (set seen id true)
+                def c@(optional):RdCommit (this.commit(id))
+                if (!null? c) {
+                    def cv:RdCommit (unwrap c)
+                    if (has anc id) {
+                        if (((strlen best) == 0) || ((RdRepo.cmp(cv.time bestTime)) > 0)) {
+                            best = id
+                            bestTime = cv.time
+                        }
+                    } {
+                        for cv.parents p:string i {
+                            push stack p
+                        }
+                    }
+                }
+            }
+        }
+        return best
+    }
+
+    ; ---------------------------------------------------------------- diff
+
+    sfn isTextPath:boolean (path:string) {
+        def exts:[string] ([] _:string (".md" ".markdown" ".txt" ".css" ".json" ".csv" ".tsv" ".svg" ".html" ".xml" ".yaml" ".yml" ".js" ".rgr"))
+        def lower:string (to_lowercase path)
+        for exts e:string i {
+            def n:int (strlen lower)
+            def m:int (strlen e)
+            if (n >= m) {
+                if ((substring lower (n - m) n) == e) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    fn diffTrees:[RdFileChange] (aId:string bId:string) {
+        def a:RdTree (this.tree(aId))
+        def b:RdTree (this.tree(bId))
+        def out:[RdFileChange]
+        for b.entries nb:RdEntry i {
+            def oa@(optional):RdEntry (a.find(nb.path))
+            if (null? oa) {
+                def c (new RdFileChange())
+                c.path = nb.path
+                c.kind = "added"
+                c.newBlob = nb.blob
+                c.newSize = nb.size
+                c.newRecipe = nb.recipe
+                push out c
+            } {
+                def o:RdEntry (unwrap oa)
+                if ((o.blob != nb.blob) || (o.recipe != nb.recipe)) {
+                    def c2 (new RdFileChange())
+                    c2.path = nb.path
+                    c2.kind = "changed"
+                    if (o.blob == nb.blob) {
+                        c2.kind = "recipe"
+                    }
+                    c2.oldBlob = o.blob
+                    c2.newBlob = nb.blob
+                    c2.oldSize = o.size
+                    c2.newSize = nb.size
+                    c2.oldRecipe = o.recipe
+                    c2.newRecipe = nb.recipe
+                    if ((o.blob != nb.blob) && (RdRepo.isTextPath(nb.path))) {
+                        def ld:RdLineDiff (RdText.diff((this.readText(o.blob)) (this.readText(nb.blob))))
+                        c2.added = ld.added
+                        c2.removed = ld.removed
+                    }
+                    push out c2
+                }
+            }
+        }
+        for a.entries oe:RdEntry j {
+            def nbe@(optional):RdEntry (b.find(oe.path))
+            if (null? nbe) {
+                def c3 (new RdFileChange())
+                c3.path = oe.path
+                c3.kind = "removed"
+                c3.oldBlob = oe.blob
+                c3.oldSize = oe.size
+                c3.oldRecipe = oe.recipe
+                push out c3
+            }
+        }
+        return out
+    }
+
+    ; what commit b changed against commit a
+    fn diffCommits:[RdFileChange] (a:string b:string) {
+        def ca@(optional):RdCommit (this.commit(a))
+        def cb@(optional):RdCommit (this.commit(b))
+        def empty:[RdFileChange]
+        if ((null? ca) || (null? cb)) {
+            return empty
+        }
+        def cav:RdCommit (unwrap ca)
+        def cbv:RdCommit (unwrap cb)
+        return this.diffTrees(cav.tree cbv.tree)
+    }
+
+    ; the unified text diff of one file between two commits
+    fn diffText:string (a:string b:string path:string context:int) {
+        def oldText:string (this.fileText(a path))
+        def newText:string (this.fileText(b path))
+        return (RdText.unified((RdText.diff(oldText newText)) context))
+    }
+
+    fn fileText:string (commitId:string path:string) {
+        def c@(optional):RdCommit (this.commit(commitId))
+        if (null? c) {
+            return ""
+        }
+        def cv:RdCommit (unwrap c)
+        def t:RdTree (this.tree(cv.tree))
+        def e@(optional):RdEntry (t.find(path))
+        if (null? e) {
+            return ""
+        }
+        return this.readText((RdRepo.blobOf(e)))
+    }
+
+    fn fileBytes:buffer (commitId:string path:string) {
+        def c@(optional):RdCommit (this.commit(commitId))
+        if (null? c) {
+            return (buffer_alloc 0)
+        }
+        def cv:RdCommit (unwrap c)
+        def t:RdTree (this.tree(cv.tree))
+        def e@(optional):RdEntry (t.find(path))
+        if (null? e) {
+            return (buffer_alloc 0)
+        }
+        return this.read((RdRepo.blobOf(e)))
+    }
+
+    ; --------------------------------------------------------------- merge
+
+    sfn sameEntry:boolean (a@(optional):RdEntry b@(optional):RdEntry) {
+        if ((null? a) && (null? b)) {
+            return true
+        }
+        if ((null? a) || (null? b)) {
+            return false
+        }
+        def x:RdEntry (unwrap a)
+        def y:RdEntry (unwrap b)
+        return ((x.blob == y.blob) && (x.recipe == y.recipe))
+    }
+
+    ; three-way merge of two commits. Files only one side changed are taken
+    ; from it; text files both changed are merged by lines; anything else both
+    ; changed differently is a conflict for the user.
+    fn merge:RdRepoMerge (mine:string theirs:string) {
+        def res (new RdRepoMerge())
+        res.mine = mine
+        res.theirs = theirs
+        res.base = this.mergeBase(mine theirs)
+        def bt (new RdTree())
+        if ((strlen res.base) > 0) {
+            def bc@(optional):RdCommit (this.commit(res.base))
+            if (!null? bc) {
+                def bcv:RdCommit (unwrap bc)
+                bt = this.tree(bcv.tree)
+            }
+        }
+        def mt:RdTree (this.treeOf(mine))
+        def tt:RdTree (this.treeOf(theirs))
+        ; every path of the three trees, once
+        def paths:[string]
+        def seen:[string:boolean]
+        for mt.entries e1:RdEntry i {
+            if ((has seen e1.path) == false) {
+                (set seen e1.path true)
+                push paths e1.path
+            }
+        }
+        for tt.entries e2:RdEntry j {
+            if ((has seen e2.path) == false) {
+                (set seen e2.path true)
+                push paths e2.path
+            }
+        }
+        for bt.entries e3:RdEntry k {
+            if ((has seen e3.path) == false) {
+                (set seen e3.path true)
+                push paths e3.path
+            }
+        }
+        def sortedPaths:[string] (RdRepo.sortStrings(paths))
+        for sortedPaths p:string q {
+            def b@(optional):RdEntry (bt.find(p))
+            def m@(optional):RdEntry (mt.find(p))
+            def t@(optional):RdEntry (tt.find(p))
+            def f (new RdFileMerge())
+            f.path = p
+            f.mine = m
+            f.theirs = t
+            if (RdRepo.sameEntry(m t)) {
+                f.result = "same"
+                f.entry = m
+            } {
+                if (RdRepo.sameEntry(b t)) {
+                    f.result = "mine"
+                    f.entry = m
+                } {
+                    if (RdRepo.sameEntry(b m)) {
+                        f.result = "theirs"
+                        f.entry = t
+                    } {
+                        f.result = "conflict"
+                        ; both changed: lines can be merged when it is text
+                        ; on both sides and the recipe is the same
+                        if ((((!null? m) && (!null? t)) && (RdRepo.isTextPath(p))) && ((RdRepo.recipeOf(m)) == (RdRepo.recipeOf(t)))) {
+                            def baseText:string ""
+                            if (!null? b) {
+                                baseText = this.readText((RdRepo.blobOf(b)))
+                            }
+                            def mm:RdMerge (RdText.merge3(baseText (this.readText((RdRepo.blobOf(m)))) (this.readText((RdRepo.blobOf(t))))))
+                            f.text = true
+                            f.merge = mm
+                            if (mm.clean()) {
+                                f.result = "merged"
+                                def ne:RdEntry (this.entryOf(p (RdBytes.fromText((mm.text("markers")))) (RdRepo.recipeOf(m))))
+                                f.entry = ne
+                            }
+                        }
+                    }
+                }
+            }
+            if (f.result == "conflict") {
+                res.conflicts = (res.conflicts + 1)
+            }
+            push res.files f
+        }
+        return res
+    }
+
+    ; the merge result as a tree. `picks`: for each conflict in order,
+    ; "mine", "theirs" (whole file) or, for a text conflict, a list of picks
+    ; per conflicting region joined with "," ("mine,theirs,both")
+    fn mergedTree:RdTree (res:RdRepoMerge picks:[string]) {
+        def t (new RdTree())
+        def k:int 0
+        for res.files f:RdFileMerge i {
+            if (f.result != "conflict") {
+                if (!null? f.entry) {
+                    push t.entries (unwrap f.entry)
+                }
+            } {
+                def pick:string "mine"
+                if (k < (array_length picks)) {
+                    pick = (itemAt picks k)
+                }
+                k = (k + 1)
+                if (pick == "theirs") {
+                    if (!null? f.theirs) {
+                        push t.entries (unwrap f.theirs)
+                    }
+                } {
+                    if ((pick == "mine") || (f.text == false)) {
+                        if (!null? f.mine) {
+                            push t.entries (unwrap f.mine)
+                        }
+                    } {
+                        def mm:RdMerge (unwrap f.merge)
+                        def regionPicks:[string] (strsplit pick ",")
+                        def txt:string (mm.resolve(regionPicks))
+                        push t.entries (this.entryOf(f.path (RdBytes.fromText(txt)) (RdRepo.recipeOf(f.mine))))
+                    }
+                }
+            }
+        }
+        return t
+    }
+
+    ; bytes stored for all objects (whole + deltas)
+    fn storedBytes:int () {
+        def total:int 0
+        def keys:[string] (keys objects)
+        for keys id:string i {
+            def s:RdStored (unwrap (get objects id))
+            total = (total + (buffer_length s.data))
+        }
+        return total
+    }
+
+    ; ------------------------------------------------------------ helpers
+
+    fn treeOf:RdTree (commitId:string) {
+        def c@(optional):RdCommit (this.commit(commitId))
+        if (null? c) {
+            return (new RdTree())
+        }
+        def cv:RdCommit (unwrap c)
+        return this.tree(cv.tree)
+    }
+
+    sfn blobOf:string (e@(optional):RdEntry) {
+        if (null? e) {
+            return ""
+        }
+        def v:RdEntry (unwrap e)
+        return v.blob
+    }
+
+    sfn recipeOf:string (e@(optional):RdEntry) {
+        if (null? e) {
+            return ""
+        }
+        def v:RdEntry (unwrap e)
+        return v.recipe
+    }
+
+    sfn toInt:int (s:string) {
+        def v:int 0
+        def i:int 0
+        def n:int (strlen s)
+        while (i < n) {
+            def c:int (charAt s i)
+            if ((c >= 48) && (c <= 57)) {
+                v = ((v * 10) + (c - 48))
+            }
+            i = (i + 1)
+        }
+        return v
+    }
+
+    ; compare by UTF-16 code units (ISO times and ASCII paths sort right)
+    sfn cmp:int (a:string b:string) {
+        def na:int (strlen a)
+        def nb:int (strlen b)
+        def i:int 0
+        while ((i < na) && (i < nb)) {
+            def ca:int (charAt a i)
+            def cb:int (charAt b i)
+            if (ca != cb) {
+                return (ca - cb)
+            }
+            i = (i + 1)
+        }
+        return (na - nb)
+    }
+
+    sfn sortStrings:[string] (list:[string]) {
+        ; insertion sort: trees are small
+        def out:[string]
+        for list s:string i {
+            push out s
+        }
+        def n:int (array_length out)
+        def k:int 1
+        while (k < n) {
+            def cur:string (itemAt out k)
+            def j:int (k - 1)
+            while ((j >= 0) && ((RdRepo.cmp((itemAt out j) cur)) > 0)) {
+                (set out (j + 1) (itemAt out j))
+                j = (j - 1)
+            }
+            (set out (j + 1) cur)
+            k = (k + 1)
+        }
+        return out
+    }
+}
