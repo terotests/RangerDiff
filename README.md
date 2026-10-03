@@ -20,7 +20,8 @@ benchmark). Keep the original once and the edit as a recipe in the tree
 entry (`{"bright":20}`, a crop…); a recipe-only change stores no picture.
 
 The design and the reasons are in [DESIGN.md](DESIGN.md); sizes and speed
-in [BENCHMARK.md](BENCHMARK.md).
+in [BENCHMARK.md](BENCHMARK.md), and next to xdelta3, bsdiff, zstd
+`--patch-from` and git in [COMPARISON.md](COMPARISON.md).
 
 ## Use from JavaScript
 
@@ -43,6 +44,7 @@ next to this one (or `RANGER_DIR=/path/to/Ranger`).
 ```
 npm test          # compile and run tests/*Tests.rgr
 npm run bench     # writes BENCHMARK.md
+npm run compare   # writes COMPARISON.md (xdelta3, bsdiff, zstd, git on PATH)
 npm run build     # writes dist/rangerdiff.mjs (commit it)
 npm run testdata  # regenerates testdata/xlsx and testdata/images (openpyxl, Pillow)
 ```
