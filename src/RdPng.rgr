@@ -1,0 +1,225 @@
+; SPDX-License-Identifier: MIT
+
+; ============================================================================
+; RdPng.rgr — the delta of a PNG taken on its pixels, not its compressed bytes
+; ============================================================================
+; A PNG keeps its pixels in IDAT chunks, deflate-compressed: a small change
+; to the picture (an arrow drawn on a screenshot) changes most compressed
+; bytes after it. The delta is taken on two segments instead:
+;
+;   skeleton  the file with the IDAT data left out (signature, IHDR, PLTE,
+;             text chunks…; the first IDAT kept as an empty chunk to mark
+;             where the pixels go)
+;   pixels    the inflated IDAT stream: one filter byte and the bytes of each
+;             row. An edit changes the rows it touches.
+;
+;   'R' 'D' version=1 kind=3 · varint len · skeleton delta · varint len ·
+;   pixel delta
+;
+; The rebuilt PNG has the same pixels and chunks; its IDAT is written with
+; stored (uncompressed) deflate blocks, so it is larger than the original
+; until the host compresses it again.
+; ============================================================================
+
+Import "pkg:core/RgU32.rgr"
+Import "pkg:zip/Inflate.rgr"
+Import "RdDelta.rgr"
+Import "RdZip.rgr"
+
+class RdPngParts {
+    def ok:boolean false
+    def error:string ""
+    def skeleton:buffer (buffer_alloc 0)
+    def pixels:buffer (buffer_alloc 0)
+
+    Constructor () {
+    }
+}
+
+class RdPng {
+
+    static sfn isPng:boolean (b:buffer) {
+        if ((buffer_length b) < 8) {
+            return false
+        }
+        return ((((buffer_get b 0) == 137) && ((buffer_get b 1) == 80)) && (((buffer_get b 2) == 78) && ((buffer_get b 3) == 71)))
+    }
+
+    static sfn u32be:int (b:buffer p:int) {
+        return (RgU32.fromBytesBE((buffer_get b p) (buffer_get b (p + 1)) (buffer_get b (p + 2)) (buffer_get b (p + 3))))
+    }
+
+    static sfn isType:boolean (b:buffer p:int t:string) {
+        def i:int 0
+        while (i < 4) {
+            if ((buffer_get b (p + i)) != (charAt t i)) {
+                return false
+            }
+            i = (i + 1)
+        }
+        return true
+    }
+
+    static sfn split:RdPngParts (b:buffer) {
+        def parts (new RdPngParts())
+        if ((RdPng.isPng(b)) == false) {
+            parts.error = "not a PNG"
+            return parts
+        }
+        def n:int (buffer_length b)
+        def skel (new RdWriter())
+        def zdata (new RdWriter())
+        skel.bytes(b 0 8)
+        def p:int 8
+        def marked:boolean false
+        while ((p + 12) <= n) {
+            def len:int (RdPng.u32be(b p))
+            if ((len < 0) || (((p + 12) + len) > n)) {
+                parts.error = "broken chunk"
+                return parts
+            }
+            if (RdPng.isType(b (p + 4) "IDAT")) {
+                zdata.bytes(b (p + 8) len)
+                if (marked == false) {
+                    ; an empty IDAT marks the place
+                    skel.u32(0)
+                    skel.bytes(b (p + 4) 4)
+                    skel.u32(0)
+                    marked = true
+                }
+            } {
+                skel.bytes(b p (len + 12))
+            }
+            p = ((p + 12) + len)
+        }
+        if (marked == false) {
+            parts.error = "no IDAT"
+            return parts
+        }
+        def z:buffer (zdata.toBuffer())
+        if ((buffer_length z) < 6) {
+            parts.error = "IDAT too short"
+            return parts
+        }
+        def inf (new Inflate())
+        parts.pixels = (inf.decompressFrom(z 2))
+        parts.skeleton = (skel.toBuffer())
+        parts.ok = true
+        return parts
+    }
+
+    ; skeleton + pixels → a PNG, the pixels in stored deflate blocks
+    static sfn join:buffer (skeleton:buffer pixels:buffer) {
+        def w (new RdWriter())
+        def n:int (buffer_length skeleton)
+        w.bytes(skeleton 0 8)
+        def p:int 8
+        while ((p + 12) <= n) {
+            def len:int (RdPng.u32be(skeleton p))
+            if (((len == 0) && (RdPng.isType(skeleton (p + 4) "IDAT")))) {
+                def z:buffer (RdPng.zlibStored(pixels))
+                w.u32((buffer_length z))
+                def typeAndData (new RdWriter())
+                typeAndData.bytes(skeleton (p + 4) 4)
+                typeAndData.all(z)
+                def td:buffer (typeAndData.toBuffer())
+                w.all(td)
+                w.u32((RdZip.crc32(td)))
+            } {
+                w.bytes(skeleton p (len + 12))
+            }
+            p = ((p + 12) + len)
+        }
+        return w.toBuffer()
+    }
+
+    static sfn zlibStored:buffer (data:buffer) {
+        def w (new RdWriter())
+        w.byte(120)
+        w.byte(1)
+        def n:int (buffer_length data)
+        def p:int 0
+        if (n == 0) {
+            w.byte(1)
+            w.u16le(0)
+            w.u16le(65535)
+        }
+        while (p < n) {
+            def len:int (n - p)
+            if (len > 65535) {
+                len = 65535
+            }
+            def last:int 0
+            if ((p + len) >= n) {
+                last = 1
+            }
+            w.byte(last)
+            w.u16le(len)
+            w.u16le((65535 - len))
+            w.bytes(data p len)
+            p = (p + len)
+        }
+        w.u32((RdBytes.adler32(data)))
+        return w.toBuffer()
+    }
+
+    static sfn diff:buffer (base:buffer target:buffer) {
+        def a:RdPngParts (RdPng.split(base))
+        def b:RdPngParts (RdPng.split(target))
+        if ((a.ok == false) || (b.ok == false)) {
+            return (RdDelta.diff(base target))
+        }
+        def ds:buffer (RdDelta.diff(a.skeleton b.skeleton))
+        def dp:buffer (RdDelta.diff(a.pixels b.pixels))
+        def w (new RdWriter())
+        w.byte(82)
+        w.byte(68)
+        w.byte(1)
+        w.byte(3)
+        w.varint((buffer_length ds))
+        w.all(ds)
+        w.varint((buffer_length dp))
+        w.all(dp)
+        return w.toBuffer()
+    }
+
+    static sfn isPngDelta:boolean (d:buffer) {
+        if ((buffer_length d) < 4) {
+            return false
+        }
+        return ((((buffer_get d 0) == 82) && ((buffer_get d 1) == 68)) && (((buffer_get d 2) == 1) && ((buffer_get d 3) == 3)))
+    }
+
+    static sfn apply:RdApplyResult (base:buffer delta:buffer) {
+        if ((RdPng.isPngDelta(delta)) == false) {
+            return (RdDelta.apply(base delta))
+        }
+        def res (new RdApplyResult())
+        def a:RdPngParts (RdPng.split(base))
+        if (a.ok == false) {
+            res.error = ("base: " + a.error)
+            return res
+        }
+        def rd (new RdReader(delta))
+        rd.pos = 4
+        def ds:buffer rd.bytes(rd.varint())
+        def dp:buffer rd.bytes(rd.varint())
+        if rd.failed {
+            res.error = "delta is truncated"
+            return res
+        }
+        def rs:RdApplyResult (RdDelta.apply(a.skeleton ds))
+        if (rs.ok == false) {
+            res.error = ("skeleton: " + rs.error)
+            return res
+        }
+        def rp:RdApplyResult (RdDelta.apply(a.pixels dp))
+        if (rp.ok == false) {
+            res.error = ("pixels: " + rp.error)
+            return res
+        }
+        res.ok = true
+        res.data = (RdPng.join(rs.data rp.data))
+        return res
+    }
+}

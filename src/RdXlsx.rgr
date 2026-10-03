@@ -1,0 +1,340 @@
+; SPDX-License-Identifier: MIT
+
+; ============================================================================
+; RdXlsx.rgr — worksheet XML in a row-relative form, so inserting or deleting
+; rows does not change every row below
+; ============================================================================
+; In a worksheet every row carries its number (`<row r="1050">`), every cell
+; its address (`<c r="F1050">`) and a formula its references (`D1050*E1050`).
+; Insert 50 rows and each of those numbers changes for the rest of the sheet,
+; which a byte delta has to spell out row by row.
+;
+; The encoded form replaces them with markers. A marker starts with byte 0x01,
+; which XML 1.0 does not allow in a document, so it cannot clash with content:
+;
+;   <row r="1050">    →  <row r="\1R+1">       the row: its distance from the
+;                                               previous row
+;   <c r="F1050">     →  <c r="F\1C">          the cell is in its row
+;   <f>D1050*E1050</f>→  <f>D\1F0*E\1F0</f>    a reference: distance from the
+;                                               formula's row
+;
+; Everything else is copied as it is. decode(encode(x)) == x is checked on
+; every encode; a sheet that does not round-trip (or holds a 0x01 byte) is
+; left as it is.
+; ============================================================================
+
+Import "RdBytes.rgr"
+
+class RdXlsx {
+
+    static sfn isSheet:boolean (name:string) {
+        return (((indexOf name "xl/worksheets/") == 0) && ((indexOf name ".xml") == ((strlen name) - 4)))
+    }
+
+    static sfn at:boolean (b:buffer p:int s:string) {
+        def n:int (strlen s)
+        if ((p + n) > (buffer_length b)) {
+            return false
+        }
+        def i:int 0
+        while (i < n) {
+            if ((buffer_get b (p + i)) != (charAt s i)) {
+                return false
+            }
+            i = (i + 1)
+        }
+        return true
+    }
+
+    static sfn byteAt:int (b:buffer p:int) {
+        if (p >= (buffer_length b)) {
+            return 0
+        }
+        return (buffer_get b p)
+    }
+
+    static sfn isDigit:boolean (c:int) {
+        return ((c >= 48) && (c <= 57))
+    }
+
+    static sfn isUpper:boolean (c:int) {
+        return ((c >= 65) && (c <= 90))
+    }
+
+    static sfn isWordChar:boolean (c:int) {
+        return (((RdXlsx.isUpper(c)) || (RdXlsx.isDigit(c))) || ((((c >= 97) && (c <= 122)) || (c == 95)) || (c == 46)))
+    }
+
+    ; a decimal int, digit by digit (no string in between)
+    static sfn writeInt:void (w:RdWriter value:int) {
+        def v:int value
+        if (v < 0) {
+            w.byte(45)
+            v = (0 - v)
+        }
+        def div:int 1
+        while ((div * 10) <= v) {
+            div = (div * 10)
+        }
+        while (div > 0) {
+            w.byte((48 + ((idiv v div) % 10)))
+            div = (idiv div 10)
+        }
+    }
+
+    ; digits at p as an int, or -1 when there are none, they start with 0
+    ; (unless the number is 0 itself) or there are more than 9
+    static sfn readNum:int (b:buffer p:int end:int) {
+        def v:int 0
+        def i:int p
+        while ((i < end) && (RdXlsx.isDigit((buffer_get b i)))) {
+            v = ((v * 10) + ((buffer_get b i) - 48))
+            i = (i + 1)
+        }
+        def len:int (i - p)
+        if ((len == 0) || (len > 9)) {
+            return -1
+        }
+        if (((buffer_get b p) == 48) && (len > 1)) {
+            return -1
+        }
+        return v
+    }
+
+    static sfn numLen:int (b:buffer p:int end:int) {
+        def i:int p
+        while ((i < end) && (RdXlsx.isDigit((buffer_get b i)))) {
+            i = (i + 1)
+        }
+        return (i - p)
+    }
+
+    ; the encoded sheet, or the sheet itself when it cannot be encoded
+    ; (check with isEncoded)
+    static sfn encode:buffer (b:buffer) {
+        def n:int (buffer_length b)
+        def i:int 0
+        while (i < n) {
+            if ((buffer_get b i) == 1) {
+                return b
+            }
+            i = (i + 1)
+        }
+        def w (new RdWriter())
+        w.ensure((n + 16))
+        def prevRow:int 0
+        def curRow:int 0
+        def inFormula:boolean false
+        def inQuote:boolean false
+        def p:int 0
+        ; the bytes [ps, p) are copied as they are, at the next marker
+        def ps:int 0
+        while (p < n) {
+            def c:int (buffer_get b p)
+            if inFormula {
+                if ((c == 60) && ((RdXlsx.byteAt(b (p + 1))) == 47)) {
+                    inFormula = false
+                    inQuote = false
+                    p = (p + 1)
+                    continue
+                }
+                if (c == 34) {
+                    inQuote = (inQuote == false)
+                }
+                ; a reference: 1-3 capitals then digits, not inside a name
+                ; or a string, not a function call
+                if ((inQuote == false) && (RdXlsx.isUpper(c))) {
+                    def prevOk:boolean true
+                    if (p > 0) {
+                        def pc:int (buffer_get b (p - 1))
+                        if (RdXlsx.isWordChar(pc)) {
+                            prevOk = false
+                        }
+                    }
+                    if prevOk {
+                        def q:int p
+                        while ((q < n) && ((RdXlsx.isUpper((buffer_get b q))) && ((q - p) < 3))) {
+                            q = (q + 1)
+                        }
+                        def dl:int (RdXlsx.numLen(b q n))
+                        def num:int (RdXlsx.readNum(b q n))
+                        def after:int (q + dl)
+                        def nextC:int 0
+                        if (after < n) {
+                            nextC = (buffer_get b after)
+                        }
+                        if ((((num > 0) && (curRow > 0)) && ((RdXlsx.isWordChar(nextC)) == false)) && (nextC != 40)) {
+                            w.bytes(b ps (q - ps))
+                            w.byte(1)
+                            w.byte(70)
+                            RdXlsx.writeInt(w (num - curRow))
+                            p = after
+                            ps = p
+                            continue
+                        }
+                        ; not a reference: the letters stay as they are
+                        p = q
+                        continue
+                    }
+                }
+                p = (p + 1)
+                continue
+            }
+            if (c == 60) {
+                def c1:int (RdXlsx.byteAt(b (p + 1)))
+                def c2:int (RdXlsx.byteAt(b (p + 2)))
+                if ((c1 == 114) && (RdXlsx.at(b p "<row "))) {
+                    ; copy up to r=" inside this tag
+                    def endTag:int p
+                    while ((endTag < n) && ((buffer_get b endTag) != 62)) {
+                        endTag = (endTag + 1)
+                    }
+                    def ra:int (RdXlsx.findAttr(b p endTag " r=\""))
+                    if (ra > 0) {
+                        def rv:int (RdXlsx.readNum(b ra endTag))
+                        def rl:int (RdXlsx.numLen(b ra endTag))
+                        if ((rv > 0) && ((buffer_get b (ra + rl)) == 34)) {
+                            w.bytes(b ps (ra - ps))
+                            w.byte(1)
+                            w.byte(82)
+                            RdXlsx.writeInt(w (rv - prevRow))
+                            prevRow = rv
+                            curRow = rv
+                            p = (ra + rl)
+                            ps = p
+                            continue
+                        }
+                    }
+                    ; a row without a number: references stay as they are
+                    curRow = 0
+                }
+                if (((c1 == 99) && (c2 == 32)) && (curRow > 0)) {
+                    def endTag2:int p
+                    while ((endTag2 < n) && ((buffer_get b endTag2) != 62)) {
+                        endTag2 = (endTag2 + 1)
+                    }
+                    def ca:int (RdXlsx.findAttr(b p endTag2 " r=\""))
+                    if (ca > 0) {
+                        def q2:int ca
+                        while ((q2 < endTag2) && (RdXlsx.isUpper((buffer_get b q2)))) {
+                            q2 = (q2 + 1)
+                        }
+                        def cv:int (RdXlsx.readNum(b q2 endTag2))
+                        def cl:int (RdXlsx.numLen(b q2 endTag2))
+                        if (((q2 > ca) && (cv == curRow)) && ((buffer_get b (q2 + cl)) == 34)) {
+                            w.bytes(b ps (q2 - ps))
+                            w.byte(1)
+                            w.byte(67)
+                            p = (q2 + cl)
+                            ps = p
+                            continue
+                        }
+                    }
+                }
+                if ((c1 == 102) && ((c2 == 62) || (c2 == 32))) {
+                    def endTag3:int p
+                    while ((endTag3 < n) && ((buffer_get b endTag3) != 62)) {
+                        endTag3 = (endTag3 + 1)
+                    }
+                    ; <f .../> has no text
+                    if ((endTag3 < n) && ((buffer_get b (endTag3 - 1)) != 47)) {
+                        p = (endTag3 + 1)
+                        inFormula = true
+                        inQuote = false
+                        continue
+                    }
+                }
+            }
+            p = (p + 1)
+        }
+        w.bytes(b ps (n - ps))
+        def enc:buffer (w.toBuffer())
+        if ((RdBytes.equal((RdXlsx.decode(enc)) b)) == false) {
+            return b
+        }
+        return enc
+    }
+
+    ; where the value of attribute `attr` (given with its quote) starts
+    ; between p and end, or -1
+    static sfn findAttr:int (b:buffer p:int end:int attr:string) {
+        def q:int p
+        while (q < end) {
+            if (RdXlsx.at(b q attr)) {
+                return (q + (strlen attr))
+            }
+            q = (q + 1)
+        }
+        return -1
+    }
+
+    static sfn isEncoded:boolean (b:buffer) {
+        def n:int (buffer_length b)
+        def i:int 0
+        while (i < n) {
+            if ((buffer_get b i) == 1) {
+                return true
+            }
+            i = (i + 1)
+        }
+        return false
+    }
+
+    ; a signed decimal at p: [value, length]
+    static sfn readSigned:[int] (b:buffer p:int) {
+        def n:int (buffer_length b)
+        def neg:boolean false
+        def i:int p
+        if ((i < n) && ((buffer_get b i) == 45)) {
+            neg = true
+            i = (i + 1)
+        }
+        def v:int 0
+        while ((i < n) && (RdXlsx.isDigit((buffer_get b i)))) {
+            v = ((v * 10) + ((buffer_get b i) - 48))
+            i = (i + 1)
+        }
+        if neg {
+            v = (0 - v)
+        }
+        def out:[int]
+        push out v
+        push out (i - p)
+        return out
+    }
+
+    static sfn decode:buffer (b:buffer) {
+        def n:int (buffer_length b)
+        def w (new RdWriter())
+        w.ensure((n + (idiv n 4)))
+        def row:int 0
+        def p:int 0
+        def ps:int 0
+        while (p < n) {
+            def c:int (buffer_get b p)
+            if ((c == 1) && ((p + 1) < n)) {
+                w.bytes(b ps (p - ps))
+                def kind:int (buffer_get b (p + 1))
+                if (kind == 67) {
+                    RdXlsx.writeInt(w row)
+                    p = (p + 2)
+                    ps = p
+                    continue
+                }
+                def sv:[int] (RdXlsx.readSigned(b (p + 2)))
+                if (kind == 82) {
+                    row = (row + (itemAt sv 0))
+                    RdXlsx.writeInt(w row)
+                } {
+                    RdXlsx.writeInt(w (row + (itemAt sv 0)))
+                }
+                p = ((p + 2) + (itemAt sv 1))
+                ps = p
+                continue
+            }
+            p = (p + 1)
+        }
+        w.bytes(b ps (n - ps))
+        return w.toBuffer()
+    }
+}

@@ -1,0 +1,168 @@
+; SPDX-License-Identifier: MIT
+; Commits, history as reverse deltas, diff between versions, merge of two
+; devices' edits, persistence through stored objects.
+
+Import "../src/RdRepo.rgr"
+Import "RdTest.rgr"
+
+class RepoTests {
+
+    sfn deck:string (n:int extra:string) {
+        def l:[string]
+        push l "---"
+        push l "title: Board meeting"
+        push l "---"
+        def i:int 1
+        while (i <= n) {
+            push l ""
+            push l ("## Slide " + (to_string i))
+            push l ""
+            push l ("- point one of slide " + (to_string i))
+            push l ("- point two of slide " + (to_string i))
+            i = (i + 1)
+        }
+        push l extra
+        return (join l "\n")
+    }
+
+    sfn files:RdTree (R:RdRepo md:string css:string pic:buffer recipe:string) {
+        def t (new RdTree())
+        push t.entries (R.entryOf("deck.md" (RdBytes.fromText(md)) ""))
+        push t.entries (R.entryOf("theme.css" (RdBytes.fromText(css)) ""))
+        push t.entries (R.entryOf("media/photo.png" pic recipe))
+        return t
+    }
+
+    sfn none:[string] () {
+        def l:[string]
+        return l
+    }
+
+    sfn one:[string] (a:string) {
+        def l:[string]
+        push l a
+        return l
+    }
+
+    sfn two:[string] (a:string b:string) {
+        def l:[string]
+        push l a
+        push l b
+        return l
+    }
+
+    sfn history:void (T:RdTest) {
+        T.start("history")
+        def R (new RdRepo())
+        def pic:buffer (buffer_read_file "testdata/images" "shot.png")
+        def css:string "h2 { color: navy; }"
+        def c1:string (R.commitTree((RepoTests.files(R (RepoTests.deck(40 "")) css pic "")) (RepoTests.none()) "tero" "laptop" "2026-10-03T10:00:00Z" "First version"))
+        def size1:int (R.storedBytes())
+        ; 20 small edits
+        def head:string c1
+        def k:int 1
+        while (k <= 20) {
+            def md:string (RepoTests.deck(40 ("Edit number " + (to_string k))))
+            def tm:string ("2026-10-03T10:" + (to_string (10 + k)) + ":00Z")
+            head = (R.commitTree((RepoTests.files(R md css pic "")) (RepoTests.one(head)) "tero" "laptop" tm ("Edit " + (to_string k))))
+            k = (k + 1)
+        }
+        def grown:int ((R.storedBytes()) - size1)
+        T.ok((grown < 12000) ("20 edits cost " + (to_string grown) + " bytes"))
+        ; every version reads back
+        def lg:[RdCommit] (R.log(head 100))
+        T.eqInt((array_length lg) 21 "21 commits in the log")
+        def newest:RdCommit (itemAt lg 0)
+        T.eqStr(newest.message "Edit 20" "newest first")
+        T.eqStr((R.fileText(c1 "deck.md")) (RepoTests.deck(40 "")) "the first version restores exactly")
+        def c5:RdCommit (itemAt lg 15)
+        T.eqStr((R.fileText(c5.id "deck.md")) (RepoTests.deck(40 "Edit number 5")) "a middle version restores")
+        ; what changed
+        def ch:[RdFileChange] (R.diffCommits(c1 head))
+        T.eqInt((array_length ch) 1 "one file changed")
+        def ch0:RdFileChange (itemAt ch 0)
+        T.eqStr(ch0.path "deck.md" "it is the deck")
+        T.eqInt(ch0.added 1 "one line added")
+        def u:string (R.diffText(c1 head "deck.md" 0))
+        T.ok(((indexOf u "+Edit number 20") >= 0) "unified diff shows the line")
+        ; a picture edited as original + recipe: no new blob
+        def before:int (R.storedBytes())
+        def withRecipe:string (R.commitTree((RepoTests.files(R (RepoTests.deck(40 "Edit number 20")) css pic "{\"bright\":20}")) (RepoTests.one(head)) "tero" "laptop" "2026-10-03T11:00:00Z" "Brighter photo"))
+        def ch2:[RdFileChange] (R.diffCommits(head withRecipe))
+        T.eqInt((array_length ch2) 1 "one change")
+        def ch20:RdFileChange (itemAt ch2 0)
+        T.eqStr(ch20.kind "recipe" "only the recipe changed")
+        T.ok((((R.storedBytes()) - before) < 1000) "a recipe edit stores no picture")
+        ; persistence: every stored object into a new repo
+        def R2 (new RdRepo())
+        def ids:[string] (R.takeDirty())
+        for ids id:string i {
+            R2.load((R.stored(id)))
+        }
+        T.eqStr((R2.fileText(c1 "deck.md")) (RepoTests.deck(40 "")) "reloaded repo restores the first version")
+        T.ok((RdBytes.equal((R2.fileBytes(withRecipe "media/photo.png")) pic)) "reloaded picture")
+        T.eqInt((array_length (R.takeDirty())) 0 "nothing dirty after taking")
+    }
+
+    sfn merging:void (T:RdTest) {
+        T.start("merge")
+        def R (new RdRepo())
+        def pic:buffer (buffer_read_file "testdata/images" "shot.png")
+        def pic2:buffer (buffer_read_file "testdata/images" "shot-annotated.png")
+        def base:string (RepoTests.deck(10 ""))
+        def css:string "h2 { color: navy; }"
+        def c0:string (R.commitTree((RepoTests.files(R base css pic "")) (RepoTests.none()) "tero" "laptop" "2026-10-03T10:00:00Z" "Base"))
+        ; laptop edits slide 2, phone edits slide 9 and the css
+        def mineMd:string (replace base "- point one of slide 2" "- point one of slide 2, revised")
+        def theirsMd:string (replace base "- point two of slide 9" "- point two of slide 9, from the phone")
+        def m1:string (R.commitTree((RepoTests.files(R mineMd css pic "")) (RepoTests.one(c0)) "tero" "laptop" "2026-10-03T10:05:00Z" "Laptop edit"))
+        def t1:string (R.commitTree((RepoTests.files(R theirsMd "h2 { color: teal; }" pic "")) (RepoTests.one(c0)) "tero" "phone" "2026-10-03T10:06:00Z" "Phone edit"))
+        T.eqStr((R.mergeBase(m1 t1)) c0 "merge base")
+        T.ok((R.isAncestor(c0 m1)) "base is an ancestor")
+        T.ok(((R.isAncestor(m1 t1)) == false) "siblings are not ancestors")
+        def mr:RdRepoMerge (R.merge(m1 t1))
+        T.eqInt(mr.conflicts 0 "no conflicts")
+        def tree:RdTree (R.mergedTree(mr (RepoTests.none())))
+        def mc:string (R.commitTree(tree (RepoTests.two(m1 t1)) "tero" "laptop" "2026-10-03T10:07:00Z" "Merge"))
+        def merged:string (R.fileText(mc "deck.md"))
+        T.ok(((indexOf merged "slide 2, revised") > 0) "laptop edit kept")
+        T.ok(((indexOf merged "from the phone") > 0) "phone edit kept")
+        T.eqStr((R.fileText(mc "theme.css")) "h2 { color: teal; }" "css from the phone")
+        ; the same line on both: a conflict, resolved per region
+        def m2:string (R.commitTree((RepoTests.files(R (replace base "## Slide 3" "## Slide 3: Budget") css pic "")) (RepoTests.one(c0)) "tero" "tab1" "2026-10-03T10:10:00Z" "Tab 1"))
+        def t2:string (R.commitTree((RepoTests.files(R (replace base "## Slide 3" "## Slide 3: Costs") css pic2 "")) (RepoTests.one(c0)) "tero" "tab2" "2026-10-03T10:11:00Z" "Tab 2"))
+        def mr2:RdRepoMerge (R.merge(m2 t2))
+        T.eqInt(mr2.conflicts 1 "one conflicting file")
+        def fm:RdFileMerge (itemAt mr2.files 0)
+        T.eqStr(fm.path "deck.md" "the deck conflicts")
+        T.ok(fm.text "a text conflict")
+        def fmm:RdMerge (unwrap fm.merge)
+        T.eqInt(fmm.conflicts 1 "one region")
+        def picFile:RdFileMerge (itemAt mr2.files 1)
+        T.eqStr(picFile.result "theirs" "the picture only changed in tab 2")
+        def tr:RdTree (R.mergedTree(mr2 (RepoTests.one("both"))))
+        def mc2:string (R.commitTree(tr (RepoTests.two(m2 t2)) "tero" "tab1" "2026-10-03T10:12:00Z" "Merge tabs"))
+        def txt:string (R.fileText(mc2 "deck.md"))
+        T.ok(((indexOf txt "## Slide 3: Budget\n## Slide 3: Costs") > 0) "both kept in order")
+        T.ok((RdBytes.equal((R.fileBytes(mc2 "media/photo.png")) pic2)) "picture from tab 2")
+        ; a picture changed on both sides is a whole-file choice
+        def m3:string (R.commitTree((RepoTests.files(R base css pic "{\"crop\":[0,0,100,100]}")) (RepoTests.one(c0)) "tero" "a" "2026-10-03T10:20:00Z" "Crop"))
+        def t3:string (R.commitTree((RepoTests.files(R base css pic2 "")) (RepoTests.one(c0)) "tero" "b" "2026-10-03T10:21:00Z" "Annotate"))
+        def mr3:RdRepoMerge (R.merge(m3 t3))
+        T.eqInt(mr3.conflicts 1 "picture conflict")
+        def tr3:RdTree (R.mergedTree(mr3 (RepoTests.one("theirs"))))
+        def pe:RdEntry (unwrap (tr3.find("media/photo.png")))
+        T.eqStr(pe.recipe "" "theirs picked")
+        ; fast-forward: one side is an ancestor of the other
+        def mr4:RdRepoMerge (R.merge(c0 m1))
+        T.eqInt(mr4.conflicts 0 "fast-forward has no conflicts")
+        T.eqStr(mr4.base c0 "fast-forward base")
+    }
+
+    sfn main:void () {
+        def T (new RdTest())
+        RepoTests.history(T)
+        RepoTests.merging(T)
+        T.done()
+    }
+}

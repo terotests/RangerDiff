@@ -1,0 +1,262 @@
+; SPDX-License-Identifier: MIT
+
+; ============================================================================
+; RdZip.rgr — read a ZIP (XLSX, DOCX, PPTX are ZIPs) into its parts, write one
+; ============================================================================
+; Reading takes the central directory, so the parts come in the archive's own
+; order. A part keeps its stored (compressed) bytes as they were: a part that
+; did not change is written back with those bytes, still compressed. A changed
+; part is written with method 0 (stored); the host can recompress it.
+; ============================================================================
+
+Import "pkg:core/RgU32.rgr"
+Import "pkg:zip/Inflate.rgr"
+Import "RdBytes.rgr"
+
+class RdZipEntry {
+    def name:string ""
+    ; 0 stored, 8 deflate
+    def method:int 0
+    def crc:int 0
+    def csize:int 0
+    def usize:int 0
+    ; the bytes as stored in the archive (compressed when method is 8)
+    def raw:buffer (buffer_alloc 0)
+    def hasContent:boolean false
+    def contentBuf:buffer (buffer_alloc 0)
+
+    Constructor () {
+    }
+
+    ; the uncompressed bytes
+    fn content:buffer () {
+        if hasContent {
+            return contentBuf
+        }
+        if (method == 8) {
+            def inf (new Inflate())
+            contentBuf = (inf.decompress(raw))
+        } {
+            contentBuf = raw
+        }
+        hasContent = true
+        return contentBuf
+    }
+
+    ; a stored part with the given bytes
+    sfn stored:RdZipEntry (name:string data:buffer) {
+        def e (new RdZipEntry())
+        e.name = name
+        e.method = 0
+        e.raw = data
+        e.contentBuf = data
+        e.hasContent = true
+        e.csize = (buffer_length data)
+        e.usize = (buffer_length data)
+        e.crc = (RdZip.crc32(data))
+        return e
+    }
+}
+
+class RdZipArchive {
+    def ok:boolean false
+    def error:string ""
+    def entries:[RdZipEntry]
+
+    Constructor () {
+    }
+
+    fn find@(optional):RdZipEntry (name:string) {
+        def found@(optional):RdZipEntry
+        for entries e:RdZipEntry i {
+            if (e.name == name) {
+                found = e
+                break
+            }
+        }
+        return found
+    }
+
+    fn names:[string] () {
+        def out:[string]
+        for entries e:RdZipEntry i {
+            push out e.name
+        }
+        return out
+    }
+}
+
+class RdZip {
+
+    static sfn u16:int (b:buffer p:int) {
+        return ((buffer_get b p) + ((buffer_get b (p + 1)) * 256))
+    }
+
+    ; a 32-bit little-endian value; sizes and offsets in a ZIP under 2 GB
+    ; fit an int, a CRC is a pattern
+    static sfn u32:int (b:buffer p:int) {
+        return (RgU32.fromBytesBE((buffer_get b (p + 3)) (buffer_get b (p + 2)) (buffer_get b (p + 1)) (buffer_get b p)))
+    }
+
+    static sfn isZip:boolean (b:buffer) {
+        if ((buffer_length b) < 22) {
+            return false
+        }
+        return (((buffer_get b 0) == 80) && (((buffer_get b 1) == 75) && (((buffer_get b 2) == 3) && ((buffer_get b 3) == 4))))
+    }
+
+    static sfn read:RdZipArchive (b:buffer) {
+        def z (new RdZipArchive())
+        def n:int (buffer_length b)
+        ; end of central directory: PK 5 6, searched from the end
+        def eocd:int -1
+        def p:int (n - 22)
+        def stop:int (n - 65557)
+        if (stop < 0) {
+            stop = 0
+        }
+        while (p >= stop) {
+            if ((((buffer_get b p) == 80) && ((buffer_get b (p + 1)) == 75)) && (((buffer_get b (p + 2)) == 5) && ((buffer_get b (p + 3)) == 6))) {
+                eocd = p
+                break
+            }
+            p = (p - 1)
+        }
+        if (eocd < 0) {
+            z.error = "not a ZIP archive"
+            return z
+        }
+        def count:int (RdZip.u16(b (eocd + 10)))
+        def cd:int (RdZip.u32(b (eocd + 16)))
+        def i:int 0
+        def at:int cd
+        while (i < count) {
+            if (((at + 46) > n) || ((RdZip.u32(b at)) != 33639248)) {
+                z.error = "broken central directory"
+                return z
+            }
+            def e (new RdZipEntry())
+            e.method = (RdZip.u16(b (at + 10)))
+            e.crc = (RdZip.u32(b (at + 16)))
+            e.csize = (RdZip.u32(b (at + 20)))
+            e.usize = (RdZip.u32(b (at + 24)))
+            def nameLen:int (RdZip.u16(b (at + 28)))
+            def extraLen:int (RdZip.u16(b (at + 30)))
+            def commentLen:int (RdZip.u16(b (at + 32)))
+            def local:int (RdZip.u32(b (at + 42)))
+            e.name = (RdBytes.toText((buffer_slice b (at + 46) ((at + 46) + nameLen))))
+            if ((e.method != 0) && (e.method != 8)) {
+                z.error = ("unsupported compression in " + e.name)
+                return z
+            }
+            ; the data is after the local header, whose extra field may differ
+            if (((local + 30) > n) || ((RdZip.u32(b local)) != 67324752)) {
+                z.error = ("broken local header of " + e.name)
+                return z
+            }
+            def dataAt:int (((local + 30) + (RdZip.u16(b (local + 26)))) + (RdZip.u16(b (local + 28))))
+            if ((dataAt + e.csize) > n) {
+                z.error = ("truncated part " + e.name)
+                return z
+            }
+            e.raw = (buffer_slice b dataAt (dataAt + e.csize))
+            push z.entries e
+            at = ((((at + 46) + nameLen) + extraLen) + commentLen)
+            i = (i + 1)
+        }
+        z.ok = true
+        return z
+    }
+
+    static sfn write:buffer (entries:[RdZipEntry]) {
+        def w (new RdWriter())
+        def offsets:[int]
+        def names:[buffer]
+        for entries e:RdZipEntry i {
+            def nb:buffer (RdBytes.fromText(e.name))
+            push names nb
+            push offsets w.len
+            w.u32le(67324752)
+            w.u16le(20)
+            ; bit 11: the name is UTF-8
+            w.u16le(2048)
+            w.u16le(e.method)
+            ; 1980-01-01 00:00
+            w.u16le(0)
+            w.u16le(33)
+            w.u32le(e.crc)
+            w.u32le((buffer_length e.raw))
+            w.u32le(e.usize)
+            w.u16le((buffer_length nb))
+            w.u16le(0)
+            w.all(nb)
+            w.all(e.raw)
+        }
+        def cdStart:int w.len
+        for entries e2:RdZipEntry j {
+            def nb2:buffer (itemAt names j)
+            w.u32le(33639248)
+            w.u16le(20)
+            w.u16le(20)
+            w.u16le(2048)
+            w.u16le(e2.method)
+            w.u16le(0)
+            w.u16le(33)
+            w.u32le(e2.crc)
+            w.u32le((buffer_length e2.raw))
+            w.u32le(e2.usize)
+            w.u16le((buffer_length nb2))
+            w.u16le(0)
+            w.u16le(0)
+            w.u16le(0)
+            w.u16le(0)
+            w.u32le(0)
+            w.u32le((itemAt offsets j))
+            w.all(nb2)
+        }
+        def cdLen:int (w.len - cdStart)
+        w.u32le(101010256)
+        w.u16le(0)
+        w.u16le(0)
+        w.u16le((array_length entries))
+        w.u16le((array_length entries))
+        w.u32le(cdLen)
+        w.u32le(cdStart)
+        w.u16le(0)
+        return w.toBuffer()
+    }
+
+    static sfn crcTable:int_buffer () {
+        def t:int_buffer (int_buffer_alloc 256)
+        def poly:int (RgU32.fromHalves(60856 33568))
+        def n:int 0
+        while (n < 256) {
+            def c:int n
+            def k:int 0
+            while (k < 8) {
+                if ((bit_and c 1) != 0) {
+                    c = (bit_xor poly (RgU32.shr(c 1)))
+                } {
+                    c = (RgU32.shr(c 1))
+                }
+                k = (k + 1)
+            }
+            (int_buffer_set t n c)
+            n = (n + 1)
+        }
+        return t
+    }
+
+    static sfn crc32:int (b:buffer) {
+        def t:int_buffer (RdZip.crcTable())
+        def c:int (RgU32.bnot(0))
+        def n:int (buffer_length b)
+        def i:int 0
+        while (i < n) {
+            def idx:int (bit_and (bit_xor c (buffer_get b i)) 255)
+            c = (bit_xor (int_buffer_get t idx) (RgU32.shr(c 8)))
+            i = (i + 1)
+        }
+        return (RgU32.bnot(c))
+    }
+}

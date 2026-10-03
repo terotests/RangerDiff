@@ -1,0 +1,359 @@
+; SPDX-License-Identifier: MIT
+
+; ============================================================================
+; RdPack.rgr — the segmented delta of a ZIP container (XLSX, DOCX, PPTX, ODS)
+; ============================================================================
+; A ZIP's bytes are compressed, so one changed cell changes every byte after
+; it. The delta is therefore taken part by part, on the uncompressed XML:
+;
+;   'R' 'D' version=1 kind=2
+;   varint parts
+;   per part, in the new archive's order:
+;     text name · u32 crc32 of the new content · byte kind
+;       0 SAME     the base part of the same name, unchanged
+;       1 DELTA    a byte delta (RdDelta) against the base part of the same name
+;       2 FULL     varint len · the bytes
+;       3 RENAMED  text base name, unchanged content
+;       5 SHEET    varint len · a byte delta between the row-relative forms
+;                  (RdXlsx) of the base worksheet and the new one
+;       6 RAW      byte method · varint usize · varint len · the part as the
+;                  new archive stores it (compressed): for a new part, or when
+;                  that is smaller than a delta
+;
+; A SAME part is written back with the base archive's compressed bytes; a
+; DELTA or FULL part is written stored. The rebuilt archive has every part
+; byte for byte; the ZIP wrapper itself may differ from the original.
+; ============================================================================
+
+Import "RdZip.rgr"
+Import "RdDelta.rgr"
+Import "RdXlsx.rgr"
+
+class RdPartChange {
+    def name:string ""
+    ; 0 same, 1 delta, 2 full (new or replaced), 3 renamed, 4 removed,
+    ; 5 delta of a worksheet's row-relative form
+    def kind:int 0
+    def baseName:string ""
+    def oldSize:int 0
+    def newSize:int 0
+    ; bytes this part takes in the delta
+    def cost:int 0
+
+    Constructor () {
+    }
+
+    fn kindName:string () {
+        if (kind == 0) {
+            return "same"
+        }
+        if ((kind == 1) || (kind == 5)) {
+            return "changed"
+        }
+        if (kind == 2) {
+            if (oldSize < 0) {
+                return "added"
+            }
+            return "replaced"
+        }
+        if (kind == 3) {
+            return "renamed"
+        }
+        return "removed"
+    }
+}
+
+class RdPackInfo {
+    def ok:boolean false
+    def error:string ""
+    def parts:[RdPartChange]
+
+    Constructor () {
+    }
+
+    fn changed:[RdPartChange] () {
+        def out:[RdPartChange]
+        for parts p:RdPartChange i {
+            if (p.kind != 0) {
+                push out p
+            }
+        }
+        return out
+    }
+}
+
+class RdPack {
+
+    ; the segmented delta of two ZIP archives; a byte delta when either
+    ; is not a ZIP
+    static sfn diff:buffer (base:buffer target:buffer) {
+        if (((RdZip.isZip(base)) == false) || ((RdZip.isZip(target)) == false)) {
+            return (RdDelta.diff(base target))
+        }
+        def za:RdZipArchive (RdZip.read(base))
+        def zb:RdZipArchive (RdZip.read(target))
+        if ((za.ok == false) || (zb.ok == false)) {
+            return (RdDelta.diff(base target))
+        }
+        return (RdPack.diffArchives(za zb))
+    }
+
+    static sfn diffArchives:buffer (za:RdZipArchive zb:RdZipArchive) {
+        def w (new RdWriter())
+        w.byte(82)
+        w.byte(68)
+        w.byte(1)
+        w.byte(2)
+        w.varint((array_length zb.entries))
+        ; crc → base name, to find renamed parts
+        def byCrc:[string:string]
+        for za.entries ea:RdZipEntry i {
+            def key:string ((to_string ea.crc) + (":" + (to_string ea.usize)))
+            (set byCrc key ea.name)
+        }
+        for zb.entries e:RdZipEntry j {
+            w.text(e.name)
+            w.u32(e.crc)
+            def old@(optional):RdZipEntry (za.find(e.name))
+            if (!null? old) {
+                def o:RdZipEntry (unwrap old)
+                if ((o.crc == e.crc) && (o.usize == e.usize)) {
+                    w.byte(0)
+                } {
+                    def nb:buffer (e.content())
+                    def sheetForm:boolean ((RdXlsx.isSheet(e.name)) && ((RdXlsx.isEncoded(nb)) == false))
+                    def d:buffer (buffer_alloc 0)
+                    if sheetForm {
+                        d = (RdDelta.diff((RdXlsx.encode((o.content()))) (RdXlsx.encode(nb))))
+                    } {
+                        d = (RdDelta.diff((o.content()) nb))
+                    }
+                    if ((buffer_length d) < (buffer_length e.raw)) {
+                        if sheetForm {
+                            w.byte(5)
+                        } {
+                            w.byte(1)
+                        }
+                        w.varint((buffer_length d))
+                        w.all(d)
+                    } {
+                        RdPack.writeRaw(w e)
+                    }
+                }
+            } {
+                def key2:string ((to_string e.crc) + (":" + (to_string e.usize)))
+                if (has byCrc key2) {
+                    w.byte(3)
+                    w.text((unwrap (get byCrc key2)))
+                } {
+                    RdPack.writeRaw(w e)
+                }
+            }
+        }
+        return w.toBuffer()
+    }
+
+    static sfn writeRaw:void (w:RdWriter e:RdZipEntry) {
+        w.byte(6)
+        w.byte(e.method)
+        w.varint(e.usize)
+        w.varint((buffer_length e.raw))
+        w.all(e.raw)
+    }
+
+    static sfn isPackDelta:boolean (d:buffer) {
+        if ((buffer_length d) < 4) {
+            return false
+        }
+        return ((((buffer_get d 0) == 82) && ((buffer_get d 1) == 68)) && (((buffer_get d 2) == 1) && ((buffer_get d 3) == 2)))
+    }
+
+    static sfn apply:RdApplyResult (base:buffer delta:buffer) {
+        if ((RdPack.isPackDelta(delta)) == false) {
+            return (RdDelta.apply(base delta))
+        }
+        def res (new RdApplyResult())
+        def za:RdZipArchive (RdZip.read(base))
+        if (za.ok == false) {
+            res.error = ("base: " + za.error)
+            return res
+        }
+        def rd (new RdReader(delta))
+        rd.pos = 4
+        def count:int rd.varint()
+        def out:[RdZipEntry]
+        def i:int 0
+        while (i < count) {
+            def name:string rd.text()
+            def crc:int rd.u32()
+            def kind:int rd.byte()
+            if rd.failed {
+                res.error = "delta is truncated"
+                return res
+            }
+            if (kind == 6) {
+                def re (new RdZipEntry())
+                re.name = name
+                re.method = rd.byte()
+                re.usize = rd.varint()
+                def rlen:int rd.varint()
+                re.raw = rd.bytes(rlen)
+                re.csize = rlen
+                re.crc = crc
+                if rd.failed {
+                    res.error = "delta is truncated"
+                    return res
+                }
+                if ((RdZip.crc32((re.content()))) != crc) {
+                    res.error = ("part does not match its checksum: " + name)
+                    return res
+                }
+                push out re
+                i = (i + 1)
+                continue
+            }
+            if ((kind == 0) || (kind == 3)) {
+                def baseName:string name
+                if (kind == 3) {
+                    baseName = rd.text()
+                }
+                def old@(optional):RdZipEntry (za.find(baseName))
+                if (null? old) {
+                    res.error = ("the base has no part " + baseName)
+                    return res
+                }
+                def o:RdZipEntry (unwrap old)
+                if (o.crc != crc) {
+                    res.error = ("the base part differs: " + baseName)
+                    return res
+                }
+                def keep (new RdZipEntry())
+                keep.name = name
+                keep.method = o.method
+                keep.crc = o.crc
+                keep.csize = o.csize
+                keep.usize = o.usize
+                keep.raw = o.raw
+                push out keep
+            } {
+                def data:buffer (buffer_alloc 0)
+                if ((kind == 1) || (kind == 5)) {
+                    def dlen:int rd.varint()
+                    def pd:buffer rd.bytes(dlen)
+                    def old2@(optional):RdZipEntry (za.find(name))
+                    if (null? old2) {
+                        res.error = ("the base has no part " + name)
+                        return res
+                    }
+                    def o2:RdZipEntry (unwrap old2)
+                    def from:buffer (o2.content())
+                    if (kind == 5) {
+                        from = (RdXlsx.encode(from))
+                    }
+                    def r:RdApplyResult (RdDelta.apply(from pd))
+                    if (r.ok == false) {
+                        res.error = ((name + ": ") + r.error)
+                        return res
+                    }
+                    data = r.data
+                    if (kind == 5) {
+                        data = (RdXlsx.decode(data))
+                    }
+                } {
+                    def flen:int rd.varint()
+                    data = rd.bytes(flen)
+                }
+                if rd.failed {
+                    res.error = "delta is truncated"
+                    return res
+                }
+                def ne:RdZipEntry (RdZipEntry.stored(name data))
+                if (ne.crc != crc) {
+                    res.error = ("part does not match its checksum: " + name)
+                    return res
+                }
+                push out ne
+            }
+            i = (i + 1)
+        }
+        res.ok = true
+        res.data = (RdZip.write(out))
+        return res
+    }
+
+    ; what changed, part by part (for a "what changed" view)
+    static sfn info:RdPackInfo (base:buffer delta:buffer) {
+        def info (new RdPackInfo())
+        if ((RdPack.isPackDelta(delta)) == false) {
+            info.error = "not a container delta"
+            return info
+        }
+        def za:RdZipArchive (RdZip.read(base))
+        def rd (new RdReader(delta))
+        rd.pos = 4
+        def count:int rd.varint()
+        def seen:[string:boolean]
+        def i:int 0
+        while (i < count) {
+            def start:int rd.pos
+            def c (new RdPartChange())
+            c.name = rd.text()
+            rd.u32()
+            c.kind = rd.byte()
+            c.oldSize = -1
+            def old@(optional):RdZipEntry (za.find(c.name))
+            if (!null? old) {
+                def oe:RdZipEntry (unwrap old)
+                c.oldSize = oe.usize
+            }
+            if (c.kind == 0) {
+                c.newSize = c.oldSize
+            }
+            if ((c.kind == 1) || (c.kind == 5)) {
+                def dlen:int rd.varint()
+                def pd:buffer rd.bytes(dlen)
+                def di:RdDeltaInfo (RdDelta.info(pd))
+                c.newSize = di.newLen
+            }
+            if (c.kind == 2) {
+                def flen:int rd.varint()
+                rd.bytes(flen)
+                c.newSize = flen
+            }
+            if (c.kind == 6) {
+                rd.byte()
+                c.newSize = rd.varint()
+                rd.bytes(rd.varint())
+                ; shown as added / replaced
+                c.kind = 2
+            }
+            if (c.kind == 3) {
+                c.baseName = rd.text()
+                def ob@(optional):RdZipEntry (za.find(c.baseName))
+                if (!null? ob) {
+                    def obe:RdZipEntry (unwrap ob)
+                    c.oldSize = obe.usize
+                    c.newSize = c.oldSize
+                }
+                (set seen c.baseName true)
+            }
+            c.cost = (rd.pos - start)
+            (set seen c.name true)
+            push info.parts c
+            i = (i + 1)
+        }
+        if za.ok {
+            for za.entries e:RdZipEntry j {
+                if ((has seen e.name) == false) {
+                    def gone (new RdPartChange())
+                    gone.name = e.name
+                    gone.kind = 4
+                    gone.oldSize = e.usize
+                    push info.parts gone
+                }
+            }
+        }
+        info.ok = (rd.failed == false)
+        return info
+    }
+}

@@ -1,0 +1,62 @@
+; SPDX-License-Identifier: MIT
+; The PNG pixel delta and the smart dispatch, on testdata/images.
+
+Import "../src/RdSmart.rgr"
+Import "RdTest.rgr"
+
+class PngTests {
+
+    sfn load:buffer (name:string) {
+        return (buffer_read_file "testdata/images" name)
+    }
+
+    sfn png:void (T:RdTest name:string) {
+        T.start(("png " + name))
+        def base:buffer (PngTests.load("shot.png"))
+        def target:buffer (PngTests.load(name))
+        def d:buffer (RdPng.diff(base target))
+        T.ok((RdPng.isPngDelta(d)) "is a pixel delta")
+        def r:RdApplyResult (RdPng.apply(base d))
+        T.ok(r.ok ("applies " + r.error))
+        ; same skeleton and pixels as the target
+        def want:RdPngParts (RdPng.split(target))
+        def got:RdPngParts (RdPng.split(r.data))
+        T.ok(got.ok ("rebuilt PNG reads " + got.error))
+        T.ok((RdBytes.equal(want.pixels got.pixels)) "same pixels")
+        T.ok((RdBytes.equal(want.skeleton got.skeleton)) "same chunks")
+        def plain:buffer (RdDelta.diff(base target))
+        T.ok(((buffer_length d) < (buffer_length plain)) ((("pixel delta " + (to_string (buffer_length d))) + " < byte delta ") + (to_string (buffer_length plain))))
+    }
+
+    sfn smart:void (T:RdTest) {
+        T.start("smart")
+        def b1:buffer (PngTests.load("shot.png"))
+        def b2:buffer (PngTests.load("shot-annotated.png"))
+        def d:buffer (RdSmart.diff(b1 b2))
+        T.eqInt((RdSmart.kindOf(d)) 3 "png gets the pixel delta")
+        T.ok(((RdSmart.apply(b1 d)).ok) "applies")
+        def x1:buffer (buffer_read_file "testdata/xlsx" "base.xlsx")
+        def x2:buffer (buffer_read_file "testdata/xlsx" "edit-cell.xlsx")
+        def dx:buffer (RdSmart.diff(x1 x2))
+        T.eqInt((RdSmart.kindOf(dx)) 2 "xlsx gets the segmented delta")
+        def t1:buffer (RdBytes.fromText("# Title\n\nSome text\n"))
+        def t2:buffer (RdBytes.fromText("# Title\n\nSome more text\n"))
+        def dt:buffer (RdSmart.diff(t1 t2))
+        T.eqInt((RdSmart.kindOf(dt)) 1 "text gets the byte delta")
+        T.ok((RdSmart.exact(dt)) "byte delta is exact")
+        def rt:RdApplyResult (RdSmart.apply(t1 dt))
+        T.ok((RdBytes.equal(rt.data t2)) "text applies")
+        ; a zlib stream with no pixels still reads
+        def z:buffer (RdPng.zlibStored((buffer_alloc 0)))
+        def inf (new Inflate())
+        T.eqInt((buffer_length (inf.decompressFrom(z 2))) 0 "empty stored zlib")
+    }
+
+    sfn main:void () {
+        def T (new RdTest())
+        PngTests.png(T "shot-annotated.png")
+        PngTests.png(T "shot-text.png")
+        PngTests.smart(T)
+        T.done()
+    }
+}

@@ -1,0 +1,13 @@
+Import "../src/RdDelta.rgr"
+
+class Smoke {
+    sfn main:void () {
+        def a:buffer (RdBytes.fromText("Hello world, this is the base text of some length that is long enough."))
+        def b:buffer (RdBytes.fromText("Hello brave new world, this is the base text of some length that is long enough!"))
+        def d:buffer (RdDelta.diff(a b))
+        def r:RdApplyResult (RdDelta.apply(a d))
+        print ("ok=" + (to_string r.ok))
+        print (RdBytes.toText(r.data))
+        print ("delta bytes " + (buffer_length d))
+    }
+}

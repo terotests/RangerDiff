@@ -1,0 +1,213 @@
+; SPDX-License-Identifier: MIT
+; The byte delta: every edit kind, the edges, random edit sequences, damage.
+
+Import "../src/RdDelta.rgr"
+Import "RdTest.rgr"
+
+class DeltaTests {
+
+    sfn txt:buffer (s:string) {
+        return (RdBytes.fromText(s))
+    }
+
+    ; diff, apply, compare; returns the delta info
+    sfn roundTrip:RdDeltaInfo (T:RdTest base:buffer target:buffer what:string) {
+        def d:buffer (RdDelta.diff(base target))
+        def r:RdApplyResult (RdDelta.apply(base d))
+        T.ok(r.ok (what + " applies (" + r.error + ")"))
+        T.ok((RdBytes.equal(r.data target)) (what + " gives the new version"))
+        return (RdDelta.info(d))
+    }
+
+    sfn edges:void (T:RdTest) {
+        T.start("edges")
+        def e:buffer (buffer_alloc 0)
+        def x:buffer (DeltaTests.txt("some bytes"))
+        DeltaTests.roundTrip(T e e "empty to empty")
+        def i1:RdDeltaInfo (DeltaTests.roundTrip(T e x "empty to text"))
+        T.eqInt(i1.addBytes 10 "all added")
+        def i2:RdDeltaInfo (DeltaTests.roundTrip(T x e "text to empty"))
+        T.eqInt((array_length i2.ops) 0 "no operations")
+        def i3:RdDeltaInfo (DeltaTests.roundTrip(T x x "same"))
+        T.eqInt(i3.copies 1 "one copy")
+        T.eqInt(i3.addBytes 0 "nothing added")
+        def one:buffer (buffer_alloc 1)
+        def two:buffer (buffer_alloc 1)
+        (buffer_set two 0 7)
+        DeltaTests.roundTrip(T one two "one byte changed")
+        def R (new RdRandom(7))
+        def a:buffer R.bytes(3000)
+        def b:buffer R.bytes(3000)
+        def i4:RdDeltaInfo (DeltaTests.roundTrip(T a b "unrelated random"))
+        T.ok((i4.addBytes >= 2990) "unrelated data is added, not copied")
+    }
+
+    sfn edits:void (T:RdTest) {
+        T.start("edit commands")
+        def R (new RdRandom(11))
+        def base:buffer R.textBytes(10000)
+        def ins:buffer (DeltaTests.txt("INSERTED TEXT"))
+        ; insert in the middle: the tail moves, it is still one copy
+        def d1:buffer (RdDelta.insertAt(base 4000 ins))
+        def r1:RdApplyResult (RdDelta.apply(base d1))
+        T.ok(r1.ok "insertAt applies")
+        T.eqInt((buffer_length r1.data) 10013 "insertAt length")
+        T.ok(((buffer_length d1) < 40) "insertAt delta is small")
+        def i1:RdDeltaInfo (DeltaTests.roundTrip(T base r1.data "diff of an insert"))
+        T.eqInt(i1.copies 2 "insert: two copies")
+        T.eqInt(i1.addBytes 13 "insert: only the new bytes added")
+        ; delete
+        def d2:buffer (RdDelta.deleteAt(base 2000 500))
+        def r2:RdApplyResult (RdDelta.apply(base d2))
+        T.eqInt((buffer_length r2.data) 9500 "deleteAt length")
+        def i2:RdDeltaInfo (DeltaTests.roundTrip(T base r2.data "diff of a delete"))
+        T.eqInt(i2.copies 2 "delete: two copies")
+        T.eqInt(i2.addBytes 0 "delete: nothing added")
+        ; offset + rewrite (same length)
+        def d3:buffer (RdDelta.rewriteAt(base 5000 ins))
+        def r3:RdApplyResult (RdDelta.apply(base d3))
+        T.eqInt((buffer_length r3.data) 10000 "rewriteAt keeps the length")
+        def i3:RdDeltaInfo (DeltaTests.roundTrip(T base r3.data "diff of a rewrite"))
+        T.ok((i3.addBytes <= 13) "rewrite: at most the rewritten bytes added")
+        ; rewrite past the end grows the file
+        def d4:buffer (RdDelta.rewriteAt(base 9995 ins))
+        def r4:RdApplyResult (RdDelta.apply(base d4))
+        T.eqInt((buffer_length r4.data) 10008 "rewrite past the end")
+        ; replace a range with something longer
+        def d5:buffer (RdDelta.replaceAt(base 100 3 ins))
+        def r5:RdApplyResult (RdDelta.apply(base d5))
+        T.eqInt((buffer_length r5.data) 10010 "replaceAt length")
+        DeltaTests.roundTrip(T base r5.data "diff of a replace")
+        ; a header grows: everything after it moves
+        def hdr:buffer (R.bytes(64))
+        def grown:buffer (RdBytes.concat(hdr base))
+        def i6:RdDeltaInfo (DeltaTests.roundTrip(T base grown "header grows"))
+        T.eqInt(i6.addBytes 64 "header: only the header added")
+        T.eqInt(i6.copies 1 "header: the rest is one copy")
+        ; two halves swapped
+        def h1:buffer (buffer_slice base 0 5000)
+        def h2:buffer (buffer_slice base 5000 10000)
+        def swapped:buffer (RdBytes.concat(h2 h1))
+        def i7:RdDeltaInfo (DeltaTests.roundTrip(T base swapped "halves swapped"))
+        T.ok((i7.addBytes < 32) "swap: copies, not adds")
+        ; the same block repeated
+        def twice:buffer (RdBytes.concat(base base))
+        def i8:RdDeltaInfo (DeltaTests.roundTrip(T base twice "content doubled"))
+        T.eqInt(i8.addBytes 0 "doubled: nothing added")
+    }
+
+    ; a random edit of b
+    sfn mutate:buffer (R:RdRandom b:buffer) {
+        def n:int (buffer_length b)
+        def kind:int (R.below(5))
+        def off:int (R.below((n + 1)))
+        def len:int (R.below(200))
+        if ((off + len) > n) {
+            len = (n - off)
+        }
+        def pre:buffer (buffer_slice b 0 off)
+        def post:buffer (buffer_slice b (off + len) n)
+        if (kind == 0) {
+            ; insert
+            def mid:buffer (R.textBytes((1 + (R.below(300)))))
+            def rest:buffer (buffer_slice b off n)
+            return (RdBytes.concat((RdBytes.concat(pre mid)) rest))
+        }
+        if (kind == 1) {
+            ; delete
+            return (RdBytes.concat(pre post))
+        }
+        if (kind == 2) {
+            ; rewrite in place
+            def mid2:buffer (R.bytes(len))
+            return (RdBytes.concat((RdBytes.concat(pre mid2)) post))
+        }
+        if (kind == 3) {
+            ; move a block to the end
+            def moved:buffer (buffer_slice b off (off + len))
+            return (RdBytes.concat((RdBytes.concat(pre post)) moved))
+        }
+        ; copy a block somewhere else
+        def blk:buffer (buffer_slice b off (off + len))
+        def at:int (R.below((n + 1)))
+        def p2:buffer (buffer_slice b 0 at)
+        def q2:buffer (buffer_slice b at n)
+        return (RdBytes.concat((RdBytes.concat(p2 blk)) q2))
+    }
+
+    sfn random:void (T:RdTest) {
+        T.start("random edit sequences")
+        def R (new RdRandom(12345))
+        def round:int 0
+        def worst:double 0.0
+        while (round < 300) {
+            def size:int (R.below(20000))
+            def base:buffer (buffer_alloc 0)
+            if ((round % 3) == 0) {
+                base = R.bytes(size)
+            } {
+                base = R.textBytes(size)
+            }
+            def target:buffer base
+            def edits:int (1 + (R.below(6)))
+            def k:int 0
+            while (k < edits) {
+                target = (DeltaTests.mutate(R target))
+                k = (k + 1)
+            }
+            def d:buffer (RdDelta.diff(base target))
+            def r:RdApplyResult (RdDelta.apply(base d))
+            if (((r.ok == false) || ((RdBytes.equal(r.data target)) == false))) {
+                T.ok(false ("round " + (to_string round) + " " + r.error))
+            } {
+                T.ok(true "")
+            }
+            ; the delta must stay near the edited amount, never above the file
+            T.ok(((buffer_length d) <= ((buffer_length target) + 32)) "never much larger than the new version")
+            round = (round + 1)
+        }
+    }
+
+    sfn damage:void (T:RdTest) {
+        T.start("damage")
+        def R (new RdRandom(99))
+        def base:buffer R.textBytes(4000)
+        def target:buffer (DeltaTests.mutate(R base))
+        def d:buffer (RdDelta.diff(base target))
+        def other:buffer R.textBytes(4000)
+        def r1:RdApplyResult (RdDelta.apply(other d))
+        T.ok((r1.ok == false) "wrong base is refused")
+        def cut:buffer (buffer_slice d 0 ((buffer_length d) - 3))
+        def r2:RdApplyResult (RdDelta.apply(base cut))
+        T.ok((r2.ok == false) "truncated delta is refused")
+        def bad:buffer (buffer_slice d 0 (buffer_length d))
+        def last:int ((buffer_length bad) - 1)
+        (buffer_set bad last (((buffer_get bad last) + 1) % 256))
+        def r3:RdApplyResult (RdDelta.apply(base bad))
+        T.ok((r3.ok == false) "changed byte is caught")
+        def r4:RdApplyResult (RdDelta.apply(base (DeltaTests.txt("not a delta at all"))))
+        T.ok((r4.ok == false) "garbage is refused")
+    }
+
+    sfn reverse:void (T:RdTest) {
+        T.start("reverse")
+        def R (new RdRandom(5))
+        def base:buffer R.textBytes(8000)
+        def target:buffer (DeltaTests.mutate(R (DeltaTests.mutate(R base))))
+        def d:buffer (RdDelta.diff(base target))
+        def back:buffer (RdDelta.reverse(base d))
+        def r:RdApplyResult (RdDelta.apply(target back))
+        T.ok(r.ok "reverse applies to the new version")
+        T.ok((RdBytes.equal(r.data base)) "reverse gives the base")
+    }
+
+    sfn main:void () {
+        def T (new RdTest())
+        DeltaTests.edges(T)
+        DeltaTests.edits(T)
+        DeltaTests.random(T)
+        DeltaTests.damage(T)
+        DeltaTests.reverse(T)
+        T.done()
+    }
+}

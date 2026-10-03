@@ -1,0 +1,517 @@
+; SPDX-License-Identifier: MIT
+
+; ============================================================================
+; RdDelta.rgr — a byte delta: the new version as COPY and ADD operations
+; against the old one
+; ============================================================================
+;
+;   COPY off len   take bytes [off, off+len) of the base
+;   ADD  bytes     put these bytes in
+;
+; Every kind of edit is a short list of these:
+;
+;   insert in the middle    COPY 0 k · ADD x · COPY k rest   (the tail moves,
+;                                                             still one COPY)
+;   offset + rewrite        COPY 0 k · ADD x · COPY k+n rest
+;   offset + delete         COPY 0 k · COPY k+n rest
+;   bytes added to a header ADD x · COPY 0 all
+;
+; Encoded form ("RD" 1 1):
+;
+;   'R' 'D' version=1 kind=1
+;   varint baseLen · varint newLen · u32 adler32(base) · u32 adler32(new)
+;   ops until newLen bytes are produced:
+;     varint (len * 2 + 1) · zigzag (off - end of the previous COPY)   COPY
+;     varint (len * 2)     · len bytes                                 ADD
+;
+; Finding the copies: the base is indexed by a rolling checksum of every
+; aligned BLOCK-byte block; the new bytes are scanned one position at a time
+; and a hit is extended forwards and, into the pending ADD, backwards. A common
+; prefix and suffix are taken first, which makes a single edit exact and fast.
+; ============================================================================
+
+Import "RdBytes.rgr"
+
+class RdOp {
+    ; 0 ADD, 1 COPY
+    def kind:int 0
+    ; COPY: the base offset. ADD: the offset of its bytes in `data`
+    def off:int 0
+    def len:int 0
+    ; ADD: the bytes (from the new version, or the builder's own)
+    def data:buffer (buffer_alloc 0)
+
+    Constructor () {
+    }
+
+    fn isCopy:boolean () {
+        return (kind == 1)
+    }
+}
+
+class RdDeltaInfo {
+    def ok:boolean false
+    def error:string ""
+    def baseLen:int 0
+    def newLen:int 0
+    def baseSum:int 0
+    def newSum:int 0
+    def copyBytes:int 0
+    def addBytes:int 0
+    def copies:int 0
+    def adds:int 0
+    def ops:[RdOp]
+
+    Constructor () {
+    }
+}
+
+class RdApplyResult {
+    def ok:boolean false
+    def error:string ""
+    def data:buffer (buffer_alloc 0)
+
+    Constructor () {
+    }
+}
+
+; Collects operations, merges neighbours, writes the encoded delta.
+class RdDeltaWriter {
+    def kinds:[int]
+    def offs:[int]
+    def lens:[int]
+    ; the buffer each ADD's bytes are in (the new version, normally)
+    def srcs:[buffer]
+    def total:int 0
+
+    Constructor () {
+    }
+
+    fn copy:void (off:int len:int) {
+        if (len <= 0) {
+            return
+        }
+        def n:int (array_length kinds)
+        if (n > 0) {
+            def k:int (n - 1)
+            if (((itemAt kinds k) == 1) && (((itemAt offs k) + (itemAt lens k)) == off)) {
+                (set lens k ((itemAt lens k) + len))
+                total = (total + len)
+                return
+            }
+        }
+        push kinds 1
+        push offs off
+        push lens len
+        push srcs (buffer_alloc 0)
+        total = (total + len)
+    }
+
+    fn add:void (src:buffer off:int len:int) {
+        if (len <= 0) {
+            return
+        }
+        push kinds 0
+        push offs off
+        push lens len
+        push srcs src
+        total = (total + len)
+    }
+
+    fn encode:buffer (baseLen:int baseSum:int newSum:int) {
+        def w (new RdWriter())
+        w.byte(82)
+        w.byte(68)
+        w.byte(1)
+        w.byte(1)
+        w.varint(baseLen)
+        w.varint(total)
+        w.u32(baseSum)
+        w.u32(newSum)
+        def lastEnd:int 0
+        def n:int (array_length kinds)
+        def i:int 0
+        while (i < n) {
+            def len:int (itemAt lens i)
+            if ((itemAt kinds i) == 1) {
+                def off:int (itemAt offs i)
+                w.varint(((len * 2) + 1))
+                w.zigzag((off - lastEnd))
+                lastEnd = (off + len)
+            } {
+                w.varint((len * 2))
+                w.bytes((itemAt srcs i) (itemAt offs i) len)
+            }
+            i = (i + 1)
+        }
+        return w.toBuffer()
+    }
+}
+
+class RdDelta {
+
+    ; block size of the base index
+    static sfn blockFor:int (baseLen:int) {
+        if (baseLen > 8388608) {
+            return 32
+        }
+        return 16
+    }
+
+    ; the delta that turns `base` into `target`
+    static sfn diff:buffer (base:buffer target:buffer) {
+        def w:RdDeltaWriter (RdDelta.ops(base target))
+        return w.encode((buffer_length base) (RdBytes.adler32(base)) (RdBytes.adler32(target)))
+    }
+
+    static sfn ops:RdDeltaWriter (base:buffer target:buffer) {
+        def w (new RdDeltaWriter())
+        def bl:int (buffer_length base)
+        def tl:int (buffer_length target)
+        ; common prefix and suffix
+        def p:int 0
+        def lim:int bl
+        if (tl < lim) {
+            lim = tl
+        }
+        while ((p < lim) && ((buffer_get base p) == (buffer_get target p))) {
+            p = (p + 1)
+        }
+        def s:int 0
+        while (((s + p) < lim) && ((buffer_get base ((bl - 1) - s)) == (buffer_get target ((tl - 1) - s)))) {
+            s = (s + 1)
+        }
+        w.copy(0 p)
+        RdDelta.matchMiddle(w base target p (tl - s))
+        w.copy((bl - s) s)
+        return w
+    }
+
+    ; the new bytes [start, end) as COPYs and ADDs
+    static sfn matchMiddle:void (w:RdDeltaWriter base:buffer target:buffer start:int end:int) {
+        def bl:int (buffer_length base)
+        def B:int (RdDelta.blockFor(bl))
+        def nblocks:int (idiv bl B)
+        if ((nblocks == 0) || ((end - start) < B)) {
+            w.add(target start (end - start))
+            return
+        }
+        ; hash table: head[h] = block index + 1, next[block] = older block + 1
+        def tsize:int 1024
+        while (tsize < (nblocks * 2)) {
+            tsize = (tsize * 2)
+        }
+        def mask:int (tsize - 1)
+        def head:int_buffer (int_buffer_alloc tsize)
+        def next:int_buffer (int_buffer_alloc nblocks)
+        def bi:int 0
+        while (bi < nblocks) {
+            def h:int (RdDelta.blockHash(base (bi * B) B mask))
+            (int_buffer_set next bi (int_buffer_get head h))
+            (int_buffer_set head h (bi + 1))
+            bi = (bi + 1)
+        }
+        ; scan the new bytes with a rolling checksum
+        def lit:int start
+        def t:int start
+        def a:int 0
+        def b:int 0
+        def fresh:boolean true
+        def lastEnd:int -1
+        while ((t + B) <= end) {
+            if fresh {
+                a = 0
+                b = 0
+                def k:int 0
+                while (k < B) {
+                    def x:int (buffer_get target (t + k))
+                    a = (a + x)
+                    b = (b + a)
+                    k = (k + 1)
+                }
+                fresh = false
+            }
+            def bestOff:int -1
+            def bestFwd:int 0
+            def bestBack:int 0
+            ; the base right after the previous COPY first: an in-place
+            ; rewrite continues there
+            if (lastEnd >= 0) {
+                def fwd0:int (RdDelta.forward(base lastEnd target t end))
+                if (fwd0 >= B) {
+                    bestOff = lastEnd
+                    bestFwd = fwd0
+                }
+            }
+            def h:int (bit_and ((b * 4099) + a) mask)
+            def cand:int (int_buffer_get head h)
+            def tries:int 0
+            while ((cand > 0) && (tries < 32)) {
+                def c:int ((cand - 1) * B)
+                def fwd:int (RdDelta.forward(base c target t end))
+                if (fwd >= B) {
+                    def back:int (RdDelta.backward(base c target t lit))
+                    if ((fwd + back) > (bestFwd + bestBack)) {
+                        bestOff = c
+                        bestFwd = fwd
+                        bestBack = back
+                    }
+                }
+                cand = (int_buffer_get next (cand - 1))
+                tries = (tries + 1)
+            }
+            ; resync after an edit: repetitive data (XML) has the same
+            ; block in many places, and a copy from somewhere else can win at
+            ; t although the edited file continues right after the previous
+            ; COPY. Try base [lastEnd, lastEnd+48) against target [t, t+16)
+            def bestT:int t
+            if (((lastEnd >= 0) && ((t - lit) < 64)) && (bestFwd < 4096)) {
+                def gain:int (bestFwd + bestBack)
+                def k2:int 0
+                while ((k2 < 16) && ((t + k2) < end)) {
+                    def j2:int 0
+                    while ((j2 < 48) && ((lastEnd + j2) < bl)) {
+                        if ((buffer_get base (lastEnd + j2)) == (buffer_get target (t + k2))) {
+                            def f2:int (RdDelta.forward(base (lastEnd + j2) target (t + k2) end))
+                            if ((f2 >= B) && ((f2 - k2) > gain)) {
+                                gain = (f2 - k2)
+                                bestOff = (lastEnd + j2)
+                                bestFwd = f2
+                                bestBack = 0
+                                bestT = (t + k2)
+                            }
+                        }
+                        j2 = (j2 + 1)
+                    }
+                    k2 = (k2 + 1)
+                }
+            }
+            if (bestOff >= 0) {
+                if (bestBack == 0) {
+                    bestBack = (RdDelta.backward(base bestOff target bestT lit))
+                }
+                def from:int (bestT - bestBack)
+                w.add(target lit (from - lit))
+                w.copy((bestOff - bestBack) (bestFwd + bestBack))
+                t = (bestT + bestFwd)
+                lit = t
+                lastEnd = (bestOff + bestFwd)
+                fresh = true
+            } {
+                ; roll one byte
+                if ((t + B) < end) {
+                    def out:int (buffer_get target t)
+                    def inb:int (buffer_get target (t + B))
+                    a = ((a - out) + inb)
+                    b = ((b - (B * out)) + a)
+                }
+                t = (t + 1)
+            }
+        }
+        w.add(target lit (end - lit))
+    }
+
+    ; the same checksum as the scan's, over base[off, off+B)
+    static sfn blockHash:int (base:buffer off:int B:int mask:int) {
+        def a:int 0
+        def b:int 0
+        def k:int 0
+        while (k < B) {
+            a = (a + (buffer_get base (off + k)))
+            b = (b + a)
+            k = (k + 1)
+        }
+        return (bit_and ((b * 4099) + a) mask)
+    }
+
+    static sfn forward:int (base:buffer c:int target:buffer t:int end:int) {
+        def bl:int (buffer_length base)
+        def n:int 0
+        while ((((c + n) < bl) && ((t + n) < end)) && ((buffer_get base (c + n)) == (buffer_get target (t + n)))) {
+            n = (n + 1)
+        }
+        return n
+    }
+
+    ; how far base[..c) and target[lit..t) agree backwards from c and t
+    static sfn backward:int (base:buffer c:int target:buffer t:int lit:int) {
+        def n:int 0
+        while ((((c - n) > 0) && ((t - n) > lit)) && ((buffer_get base ((c - n) - 1)) == (buffer_get target ((t - n) - 1)))) {
+            n = (n + 1)
+        }
+        return n
+    }
+
+    ; ------------------------------------------------------------------ read
+
+    static sfn info:RdDeltaInfo (delta:buffer) {
+        def r:RdDeltaInfo (new RdDeltaInfo())
+
+        def rd (new RdReader(delta))
+        if ((((rd.byte()) != 82) || ((rd.byte()) != 68)) || (((rd.byte()) != 1) || ((rd.byte()) != 1))) {
+            r.error = "not a RangerDiff byte delta"
+            return r
+        }
+        r.baseLen = rd.varint()
+        r.newLen = rd.varint()
+        r.baseSum = rd.u32()
+        r.newSum = rd.u32()
+        def produced:int 0
+        def lastEnd:int 0
+        while ((produced < r.newLen) && (rd.failed == false)) {
+            def hdr:int rd.varint()
+            def op (new RdOp())
+            op.kind = (hdr % 2)
+            op.len = (idiv hdr 2)
+            if (op.len <= 0) {
+                r.error = "empty operation"
+                return r
+            }
+            if (op.kind == 1) {
+                op.off = (lastEnd + (rd.zigzag()))
+                if ((op.off < 0) || ((op.off + op.len) > r.baseLen)) {
+                    r.error = "COPY outside the base"
+                    return r
+                }
+                lastEnd = (op.off + op.len)
+                r.copyBytes = (r.copyBytes + op.len)
+                r.copies = (r.copies + 1)
+            } {
+                op.data = rd.bytes(op.len)
+                r.addBytes = (r.addBytes + op.len)
+                r.adds = (r.adds + 1)
+            }
+            produced = (produced + op.len)
+            push r.ops op
+        }
+        if rd.failed {
+            r.error = "delta is truncated"
+            return r
+        }
+        if (produced != r.newLen) {
+            r.error = "operations do not add up to the new length"
+            return r
+        }
+        if ((rd.eof()) == false) {
+            r.error = "bytes after the last operation"
+            return r
+        }
+        r.ok = true
+        return r
+    }
+
+    static sfn apply:RdApplyResult (base:buffer delta:buffer) {
+        def res (new RdApplyResult())
+        def info:RdDeltaInfo (RdDelta.info(delta))
+        if (info.ok == false) {
+            res.error = info.error
+            return res
+        }
+        if ((buffer_length base) != info.baseLen) {
+            res.error = "the base has the wrong length"
+            return res
+        }
+        if ((RdBytes.adler32(base)) != info.baseSum) {
+            res.error = "the base is not the one this delta was made from"
+            return res
+        }
+        def out:buffer (buffer_alloc info.newLen)
+        def at:int 0
+        for info.ops op:RdOp i {
+            if (op.kind == 1) {
+                (buffer_copy out at base op.off op.len)
+            } {
+                (buffer_copy out at op.data 0 op.len)
+            }
+            at = (at + op.len)
+        }
+        if ((RdBytes.adler32(out)) != info.newSum) {
+            res.error = "the result does not match the checksum"
+            return res
+        }
+        res.ok = true
+        res.data = out
+        return res
+    }
+
+    ; ----------------------------------------------------- edits as deltas
+    ; An editor that knows what it did can say so without a diff.
+
+    static sfn fromOps:buffer (base:buffer w:RdDeltaWriter) {
+        def tmp:buffer (RdDelta.encode0(base w))
+        def r:RdApplyResult (RdDelta.applyUnchecked(base tmp))
+        return w.encode((buffer_length base) (RdBytes.adler32(base)) (RdBytes.adler32(r.data)))
+    }
+
+    ; insert `bytes` at `off`
+    static sfn insertAt:buffer (base:buffer off:int bytes:buffer) {
+        def w (new RdDeltaWriter())
+        w.copy(0 off)
+        w.add(bytes 0 (buffer_length bytes))
+        w.copy(off ((buffer_length base) - off))
+        return (RdDelta.fromOps(base w))
+    }
+
+    ; delete `len` bytes at `off`
+    static sfn deleteAt:buffer (base:buffer off:int len:int) {
+        def w (new RdDeltaWriter())
+        w.copy(0 off)
+        w.copy((off + len) (((buffer_length base) - off) - len))
+        return (RdDelta.fromOps(base w))
+    }
+
+    ; write `bytes` over the base from `off` (may run past the end)
+    static sfn rewriteAt:buffer (base:buffer off:int bytes:buffer) {
+        def bl:int (buffer_length base)
+        def n:int (buffer_length bytes)
+        def w (new RdDeltaWriter())
+        w.copy(0 off)
+        w.add(bytes 0 n)
+        if ((off + n) < bl) {
+            w.copy((off + n) ((bl - off) - n))
+        }
+        return (RdDelta.fromOps(base w))
+    }
+
+    ; replace `len` bytes at `off` with `bytes`
+    static sfn replaceAt:buffer (base:buffer off:int len:int bytes:buffer) {
+        def w (new RdDeltaWriter())
+        w.copy(0 off)
+        w.add(bytes 0 (buffer_length bytes))
+        w.copy((off + len) (((buffer_length base) - off) - len))
+        return (RdDelta.fromOps(base w))
+    }
+
+    ; the ops encoded with zero checksums, to build the new version once
+    static sfn encode0:buffer (base:buffer w:RdDeltaWriter) {
+        return w.encode((buffer_length base) 0 0)
+    }
+
+    static sfn applyUnchecked:RdApplyResult (base:buffer delta:buffer) {
+        def res (new RdApplyResult())
+        def info:RdDeltaInfo (RdDelta.info(delta))
+        if (info.ok == false) {
+            res.error = info.error
+            return res
+        }
+        def out:buffer (buffer_alloc info.newLen)
+        def at:int 0
+        for info.ops op:RdOp i {
+            if (op.kind == 1) {
+                (buffer_copy out at base op.off op.len)
+            } {
+                (buffer_copy out at op.data 0 op.len)
+            }
+            at = (at + op.len)
+        }
+        res.ok = true
+        res.data = out
+        return res
+    }
+
+    ; the delta that undoes `delta` (new → base), for reverse-delta storage
+    static sfn reverse:buffer (base:buffer delta:buffer) {
+        def r:RdApplyResult (RdDelta.apply(base delta))
+        return (RdDelta.diff(r.data base))
+    }
+}
