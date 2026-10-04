@@ -1,0 +1,289 @@
+; SPDX-License-Identifier: MIT
+; Text deltas and their transformation: the properties OT rests on, and many
+; clients editing at once through one hub.
+
+Import "../src/RdOt.rgr"
+Import "RdTest.rgr"
+
+class OtSim {
+    def id:string ""
+    def text:string ""
+    def client:RdOtClient (new RdOtClient(0))
+    ; the hub's edits not yet delivered here, in order
+    def inbox:[RdOtLogged]
+    def inFlight:boolean false
+
+    Constructor () {
+    }
+}
+
+class OtTests {
+
+    sfn pieces:[string] () {
+        return ([] _:string ("a" "b" "xy" " " "\n" "## " "ä" "😀" "👨‍👩‍👧" "\"q\"" "\\"))
+    }
+
+    sfn randomString:string (R:RdRandom n:int) {
+        def ps:[string] (OtTests.pieces())
+        def out:string ""
+        def i:int 0
+        while (i < n) {
+            out = (out + (itemAt ps (R.below((array_length ps)))))
+            i = (i + 1)
+        }
+        return out
+    }
+
+    ; a random edit of `s`: a few replaces at random places, cut at whole
+    ; characters (as an editor makes them)
+    sfn randomDelta:RdOtDelta (R:RdRandom s:string) {
+        def n:int (strlen s)
+        def d:RdOtDelta (new RdOtDelta())
+        def pos:int 0
+        def edits:int (1 + (R.below(3)))
+        def k:int 0
+        while (k < edits) {
+            def at:int (pos + (R.below(((n - pos) + 1))))
+            at = (OtTests.whole(s at))
+            if (at < pos) {
+                at = pos
+            }
+            def del:int (R.below(4))
+            if ((at + del) > n) {
+                del = (n - at)
+            }
+            del = ((OtTests.whole(s (at + del))) - at)
+            if (del < 0) {
+                del = 0
+            }
+            d.retain((at - pos))
+            if ((R.below(3)) > 0) {
+                d.insert((OtTests.randomString(R (1 + (R.below(3))))))
+            }
+            d.delete(del)
+            pos = (at + del)
+            k = (k + 1)
+        }
+        d.retain((n - pos))
+        return d
+    }
+
+    ; `at` moved back off the low half of a surrogate pair
+    sfn whole:int (s:string at:int) {
+        if ((at > 0) && (at < (strlen s))) {
+            if (RdOtDelta.isLow((charAt s at))) {
+                return (at - 1)
+            }
+        }
+        return at
+    }
+
+    sfn basics:void (T:RdTest) {
+        T.start("basics")
+        def d:RdOtDelta (RdOtDelta.diff("Hello world" "Hello brave world" -1))
+        T.eqStr((d.toJson()) "[{\"retain\":6},{\"insert\":\"brave \"}]" "insert")
+        T.eqStr((d.apply("Hello world")) "Hello brave world" "apply insert")
+        def d2:RdOtDelta (RdOtDelta.diff("Hello brave world" "Hello world" -1))
+        T.eqStr((d2.toJson()) "[{\"retain\":6},{\"delete\":6}]" "delete")
+        def d3:RdOtDelta (RdOtDelta.diff("abc" "aXc" -1))
+        T.eqStr((d3.toJson()) "[{\"retain\":1},{\"insert\":\"X\"},{\"delete\":1}]" "replace: insert before delete")
+        def d4:RdOtDelta (new RdOtDelta())
+        d4.retain(1)
+        d4.delete(1)
+        d4.insert("X")
+        T.ok((d4.equals(d3)) "delete then insert is the same delta")
+        ; which a is new: the caret says
+        def e1:RdOtDelta (RdOtDelta.diff("aa" "aaa" 1))
+        T.eqStr((e1.toJson()) "[{\"insert\":\"a\"}]" "caret 1: typed at the start")
+        def e2:RdOtDelta (RdOtDelta.diff("aa" "aaa" 3))
+        T.eqStr((e2.toJson()) "[{\"retain\":2},{\"insert\":\"a\"}]" "caret 3: typed at the end")
+        def e3:RdOtDelta (RdOtDelta.diff("aaa" "aa" 0))
+        T.eqStr((e3.toJson()) "[{\"delete\":1}]" "backspace at 1")
+        ; 😀 -> 😁 share their first unit: the insert is the whole emoji
+        def s1:RdOtDelta (RdOtDelta.diff("x😀y" "x😁y" -1))
+        T.eqStr((s1.toJson()) "[{\"retain\":1},{\"insert\":\"😁\"},{\"delete\":2}]" "surrogate pair kept whole")
+        def s2:RdOtDelta (RdOtDelta.diff("😀😀" "😀" -1))
+        T.eqInt((array_length s2.ops) 2 "emoji removed: retain + delete")
+        def o:RdOtOp (itemAt s2.ops 0)
+        T.eqInt(o.n 2 "retain is a whole emoji")
+        ; JSON
+        def j:string "[{\"retain\":3},{\"insert\":\"a\\\"b\\\\c\\nd\\u0001\\u00e4\"},{\"delete\":2}]"
+        def back:RdOtDelta (RdOtDelta.fromJson(j))
+        T.eqStr((back.toJson()) "[{\"retain\":3},{\"insert\":\"a\\\"b\\\\c\\nd\\u0001ä\"},{\"delete\":2}]" "JSON round trip")
+        def p:RdOtJson (new RdOtJson("[{\"retain\":1},{\"bogus\":2}]"))
+        p.delta()
+        T.ok((p.ok == false) "unknown key refused")
+        def p2:RdOtJson (new RdOtJson("[{\"retain\":1}"))
+        p2.delta()
+        T.ok((p2.ok == false) "unclosed array refused")
+        def bad:RdOtDelta (new RdOtDelta())
+        bad.retain(10)
+        def r:RdOtApplied (bad.tryApply("short"))
+        T.ok((r.ok == false) "a delta for a longer text is refused")
+        ; transform: both insert at one place, the first argument goes first
+        def a:RdOtDelta (RdOtDelta.diff("ab" "aXb" -1))
+        def b:RdOtDelta (RdOtDelta.diff("ab" "aYb" -1))
+        def pr:RdOtPair (RdOtDelta.transform(a b))
+        T.eqStr((pr.b.apply((a.apply("ab")))) "aXYb" "a first (after a)")
+        T.eqStr((pr.a.apply((b.apply("ab")))) "aXYb" "a first (after b)")
+        ; a caret after an insert at it
+        def ins:RdOtDelta (RdOtDelta.diff("abc" "aZZbc" -1))
+        T.eqInt((ins.transformIndex(1 false)) 1 "insert at the caret: the caret stays before")
+        T.eqInt((ins.transformIndex(1 true)) 3 "own insert: the caret after it")
+        T.eqInt((ins.transformIndex(2 false)) 4 "after the insert: moved")
+        def del:RdOtDelta (RdOtDelta.diff("abcdef" "af" -1))
+        T.eqInt((del.transformIndex(3 false)) 1 "inside a delete: its start")
+        T.eqInt((del.transformIndex(6 false)) 2 "after a delete: back")
+    }
+
+    sfn properties:void (T:RdTest) {
+        T.start("properties")
+        def R (new RdRandom(4242))
+        def round:int 0
+        while (round < 2000) {
+            def s:string (OtTests.randomString(R (R.below(30))))
+            def a:RdOtDelta (OtTests.randomDelta(R s))
+            def b:RdOtDelta (OtTests.randomDelta(R s))
+            def sa:string (a.apply(s))
+            def sb:string (b.apply(s))
+            def p:RdOtPair (RdOtDelta.transform(a b))
+            def ab:string (p.b.apply(sa))
+            def ba:string (p.a.apply(sb))
+            T.eqStr(ab ba "TP1: both orders give one text")
+            ; compose = one after the other
+            def c:RdOtDelta (OtTests.randomDelta(R sa))
+            def ac:RdOtDelta (a.compose(c))
+            T.eqStr((ac.apply(s)) (c.apply(sa)) "compose")
+            ; invert undoes
+            def inv:RdOtDelta (a.invert(s))
+            T.eqStr((inv.apply(sa)) s "invert")
+            ; diff of the two texts gives the second
+            def dd:RdOtDelta (RdOtDelta.diff(s sa (R.below(((strlen sa) + 1)))))
+            T.eqStr((dd.apply(s)) sa "diff")
+            ; JSON round trip
+            def j:RdOtDelta (RdOtDelta.fromJson((a.toJson())))
+            T.eqStr((j.apply(s)) sa "JSON")
+            ; a character before every edit keeps its place
+            if ((strlen s) > 0) {
+                def at:int (R.below((strlen s)))
+                def moved:int (a.transformIndex(at true))
+                def survives:boolean true
+                def pos:int 0
+                for a.ops o:RdOtOp k {
+                    if (o.kind == 3) {
+                        if ((at >= pos) && (at < (pos + o.n))) {
+                            survives = false
+                        }
+                    }
+                    if (o.kind != 2) {
+                        pos = (pos + o.n)
+                    }
+                }
+                if survives {
+                    T.eqInt((charAt sa moved) (charAt s at) "index transform keeps the character")
+                }
+            }
+            round = (round + 1)
+        }
+    }
+
+    ; `clients` editors, random edits, the hub's edits delivered late, so
+    ; many sends are on an old revision; at the end all have the hub's text
+    sfn simulate:void (T:RdTest seed:int clients:int steps:int) {
+        T.start(("simulation " + (to_string clients)) + " clients")
+        def R (new RdRandom(seed))
+        def start:string "# Title\n\nSome text 😀 here.\n"
+        def hub (new RdOtHub(start))
+        def sims:[OtSim]
+        def i:int 0
+        while (i < clients) {
+            def c:OtSim (new OtSim())
+            c.id = ("c" + (to_string i))
+            c.text = start
+            push sims c
+            i = (i + 1)
+        }
+        def stale:int 0
+        def step:int 0
+        def settle:boolean false
+        while true {
+            def busy:boolean false
+            for sims c:OtSim k {
+                if (((array_length c.inbox) > 0) || (c.client.waiting())) {
+                    busy = true
+                }
+            }
+            if (settle && (busy == false)) {
+                break
+            }
+            if (step >= steps) {
+                settle = true
+            }
+            if (step > (steps * 50)) {
+                T.ok(false "simulation did not settle")
+                return
+            }
+            step = (step + 1)
+            def c:OtSim (itemAt sims (R.below(clients)))
+            def what:int (R.below(10))
+            if (settle) {
+                what = (3 + (R.below(7)))
+            }
+            if (what < 3) {
+                ; an edit here
+                def d:RdOtDelta (OtTests.randomDelta(R c.text))
+                c.text = (d.apply(c.text))
+                c.client.local(d)
+            }
+            if ((what >= 3) && (what < 6)) {
+                ; one of the hub's edits arrives
+                if ((array_length c.inbox) > 0) {
+                    def e:RdOtLogged (itemAt c.inbox 0)
+                    remove_index c.inbox 0
+                    if ((e.client == c.id) && c.inFlight) {
+                        c.inFlight = false
+                        c.client.ack()
+                    } {
+                        def got:RdOtDelta (c.client.receive(e.delta))
+                        c.text = (got.apply(c.text))
+                    }
+                }
+            }
+            if (what >= 6) {
+                ; what waits here goes to the hub
+                def out@(optional):RdOtDelta (c.client.takeSend())
+                if (!null? out) {
+                    def d2:RdOtDelta (unwrap out)
+                    if (c.client.rev < hub.rev) {
+                        stale = (stale + 1)
+                    }
+                    if (hub.submit(c.client.rev d2 c.id)) {
+                        c.inFlight = true
+                        def last:RdOtLogged (itemAt hub.log ((array_length hub.log) - 1))
+                        for sims o:OtSim m {
+                            push o.inbox last
+                        }
+                    } {
+                        T.ok(false "the hub refused an edit")
+                    }
+                }
+            }
+        }
+        for sims c:OtSim k {
+            T.eqStr(c.text hub.text ("client " + c.id) + " has the hub's text")
+            T.eqInt(c.client.rev hub.rev ("client " + c.id) + " has every revision")
+        }
+        T.ok((hub.rev > 0) "edits went through")
+        print (((((("  " + (to_string clients)) + " clients: ") + (to_string hub.rev)) + " revisions, ") + (to_string stale)) + " sent on an older revision and transformed")
+    }
+
+    sfn main:void () {
+        def T (new RdTest())
+        OtTests.basics(T)
+        OtTests.properties(T)
+        OtTests.simulate(T 7 2 400)
+        OtTests.simulate(T 11 8 1500)
+        OtTests.simulate(T 13 32 4000)
+        T.done()
+    }
+}

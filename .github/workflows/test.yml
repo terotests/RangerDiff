@@ -27,6 +27,11 @@ jobs:
         env:
           RANGER_DIR: ${{ github.workspace }}/Ranger
         run: npm test
+      - name: Real-time editing converges, next to Yjs
+        working-directory: RangerDiff
+        run: |
+          npm ci
+          npm run bench:collab -- --check
       - name: The built module is up to date
         working-directory: RangerDiff
         env:

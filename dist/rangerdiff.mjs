@@ -5334,3 +5334,819 @@ RdRepo.sortStrings = function(list) {
   };
   return out;
 };
+export class RdOtOp  {
+  constructor() {
+    this.kind = 0;
+    this.n = 0;
+    this.text = "";
+  }
+  len () {
+    if ( this.kind == 2 ) {
+      return this.text.length;
+    }
+    return this.n;
+  };
+}
+RdOtOp.make = function(kind, n, text) {
+  const o = new RdOtOp();
+  o.kind = kind;
+  o.n = n;
+  o.text = text;
+  return o;
+};
+export class RdOtPair  {
+  constructor() {
+    this.a = new RdOtDelta();
+    this.b = new RdOtDelta();
+  }
+}
+export class RdOtDelta  {
+  constructor() {
+    this.ops = [];
+    this.baseLength = 0;
+    this.targetLength = 0;
+  }
+  retain (n) {
+    if ( n <= 0 ) {
+      return this;
+    }
+    this.baseLength = this.baseLength + n;
+    this.targetLength = this.targetLength + n;
+    const c = this.ops.length;
+    if ( c > 0 ) {
+      const last = this.ops[(c - 1)];
+      if ( last.kind == 1 ) {
+        last.n = last.n + n;
+        return this;
+      }
+    }
+    this.ops.push(RdOtOp.make(1, n, ""));
+    return this;
+  };
+  insert (s) {
+    if ( s.length == 0 ) {
+      return this;
+    }
+    this.targetLength = this.targetLength + s.length;
+    const c = this.ops.length;
+    if ( c > 0 ) {
+      const last = this.ops[(c - 1)];
+      if ( last.kind == 2 ) {
+        last.text = last.text + s;
+        return this;
+      }
+      if ( last.kind == 3 ) {
+        if ( c > 1 ) {
+          const prev = this.ops[(c - 2)];
+          if ( prev.kind == 2 ) {
+            prev.text = prev.text + s;
+            return this;
+          }
+        }
+        const del = this.ops[(c - 1)];
+        this.ops.splice(c - 1, 1).pop();
+        this.ops.push(RdOtOp.make(2, 0, s));
+        this.ops.push(del);
+        return this;
+      }
+    }
+    this.ops.push(RdOtOp.make(2, 0, s));
+    return this;
+  };
+  delete (n) {
+    if ( n <= 0 ) {
+      return this;
+    }
+    this.baseLength = this.baseLength + n;
+    const c = this.ops.length;
+    if ( c > 0 ) {
+      const last = this.ops[(c - 1)];
+      if ( last.kind == 3 ) {
+        last.n = last.n + n;
+        return this;
+      }
+    }
+    this.ops.push(RdOtOp.make(3, n, ""));
+    return this;
+  };
+  add (o) {
+    if ( o.kind == 1 ) {
+      this.retain(o.n);
+    }
+    if ( o.kind == 2 ) {
+      this.insert(o.text);
+    }
+    if ( o.kind == 3 ) {
+      this.delete(o.n);
+    }
+  };
+  padTo (__len) {
+    if ( this.baseLength < __len ) {
+      this.retain(__len - this.baseLength);
+    }
+    return this;
+  };
+  isNoop () {
+    // Loop start
+    for ( const o of this.ops) {
+      if ( o.kind != 1 ) {
+        return false;
+      }
+    }
+    return true;
+  };
+  copy () {
+    const d = new RdOtDelta();
+    // Loop start
+    for ( const o of this.ops) {
+      d.add(o);
+    }
+    return d;
+  };
+  equals (other) {
+    const a = this.copy();
+    const b = other.copy();
+    a.trimRetain();
+    b.trimRetain();
+    if ( a.ops.length != b.ops.length ) {
+      return false;
+    }
+    let i = 0;
+    while (i < a.ops.length) {
+      const x = a.ops[i];
+      const y = b.ops[i];
+      if ( (x.kind != y.kind || x.n != y.n) || x.text != y.text ) {
+        return false;
+      }
+      i = i + 1;
+    };
+    return true;
+  };
+  trimRetain () {
+    const c = this.ops.length;
+    if ( c > 0 ) {
+      const last = this.ops[(c - 1)];
+      if ( last.kind == 1 ) {
+        this.baseLength = this.baseLength - last.n;
+        this.targetLength = this.targetLength - last.n;
+        this.ops.splice(c - 1, 1).pop();
+      }
+    }
+  };
+  apply (s) {
+    const r = this.tryApply(s);
+    return r.text;
+  };
+  tryApply (s) {
+    const r = new RdOtApplied();
+    const n = s.length;
+    if ( this.baseLength > n ) {
+      r.ok = false;
+      r.error = "the delta is for a longer text";
+      return r;
+    }
+    let parts = [];
+    let pos = 0;
+    // Loop start
+    for ( const o of this.ops) {
+      if ( o.kind == 1 ) {
+        parts.push(s.substring(pos, pos + o.n ));
+        pos = pos + o.n;
+      }
+      if ( o.kind == 2 ) {
+        parts.push(o.text);
+      }
+      if ( o.kind == 3 ) {
+        pos = pos + o.n;
+      }
+    }
+    parts.push(s.substring(pos, n ));
+    r.text = parts.join("");
+    return r;
+  };
+  invert (base) {
+    const d = new RdOtDelta();
+    let pos = 0;
+    // Loop start
+    for ( const o of this.ops) {
+      if ( o.kind == 1 ) {
+        d.retain(o.n);
+        pos = pos + o.n;
+      }
+      if ( o.kind == 2 ) {
+        d.delete(o.text.length);
+      }
+      if ( o.kind == 3 ) {
+        d.insert(base.substring(pos, pos + o.n ));
+        pos = pos + o.n;
+      }
+    }
+    return d;
+  };
+  compose (b) {
+    const a = this.copy();
+    const bb = b.copy();
+    if ( a.targetLength < bb.baseLength ) {
+      a.retain(bb.baseLength - a.targetLength);
+    }
+    bb.padTo(a.targetLength);
+    const out = new RdOtDelta();
+    const ra = new RdOtReader(a);
+    const rb = new RdOtReader(bb);
+    while (ra.more() || rb.more()) {
+      if ( ra.kind() == 3 ) {
+        const da = ra.take(ra.left());
+        out.delete(da.n);
+        continue;
+      }
+      if ( rb.kind() == 2 ) {
+        const ib = rb.take(rb.left());
+        out.insert(ib.text);
+        continue;
+      }
+      if ( ra.more() == false || rb.more() == false ) {
+        return out;
+      }
+      let n = ra.left();
+      if ( rb.left() < n ) {
+        n = rb.left();
+      }
+      const x = ra.take(n);
+      const y = rb.take(n);
+      if ( x.kind == 1 ) {
+        if ( y.kind == 1 ) {
+          out.retain(n);
+        } else {
+          out.delete(n);
+        }
+      } else {
+        if ( y.kind == 1 ) {
+          out.insert(x.text);
+        }
+      }
+    };
+    return out;
+  };
+  transformIndex (at, after) {
+    let pos = 0;
+    let out = at;
+    // Loop start
+    for ( const o of this.ops) {
+      if ( pos > at ) {
+        return out;
+      }
+      if ( o.kind == 1 ) {
+        pos = pos + o.n;
+      }
+      if ( o.kind == 2 ) {
+        if ( pos < at || pos == at && after ) {
+          out = out + o.text.length;
+        }
+      }
+      if ( o.kind == 3 ) {
+        if ( pos < at ) {
+          let gone = o.n;
+          if ( at - pos < gone ) {
+            gone = at - pos;
+          }
+          out = out - gone;
+        }
+        pos = pos + o.n;
+      }
+    }
+    return out;
+  };
+  toJson () {
+    let parts = [];
+    const c = this.ops.length;
+    let i = 0;
+    while (i < c) {
+      const o = this.ops[i];
+      if ( o.kind == 1 ) {
+        if ( i < c - 1 ) {
+          parts.push(("{\"retain\":" + ((o.n).toString())) + "}");
+        }
+      }
+      if ( o.kind == 2 ) {
+        parts.push(("{\"insert\":" + RdOtDelta.quote(o.text)) + "}");
+      }
+      if ( o.kind == 3 ) {
+        parts.push(("{\"delete\":" + ((o.n).toString())) + "}");
+      }
+      i = i + 1;
+    };
+    return ("[" + parts.join(",")) + "]";
+  };
+}
+RdOtDelta.transform = function(a0, b0) {
+  const a = a0.copy();
+  const b = b0.copy();
+  let __len = a.baseLength;
+  if ( b.baseLength > __len ) {
+    __len = b.baseLength;
+  }
+  a.padTo(__len);
+  b.padTo(__len);
+  const p = new RdOtPair();
+  const ra = new RdOtReader(a);
+  const rb = new RdOtReader(b);
+  while (ra.more() || rb.more()) {
+    if ( ra.kind() == 2 ) {
+      const ia = ra.take(ra.left());
+      const s = ia.text;
+      p.a.insert(s);
+      p.b.retain(s.length);
+      continue;
+    }
+    if ( rb.kind() == 2 ) {
+      const ib2 = rb.take(rb.left());
+      const s2 = ib2.text;
+      p.a.retain(s2.length);
+      p.b.insert(s2);
+      continue;
+    }
+    if ( ra.more() == false || rb.more() == false ) {
+      return p;
+    }
+    let n = ra.left();
+    if ( rb.left() < n ) {
+      n = rb.left();
+    }
+    const x = ra.take(n);
+    const y = rb.take(n);
+    if ( x.kind == 1 && y.kind == 1 ) {
+      p.a.retain(n);
+      p.b.retain(n);
+    }
+    if ( x.kind == 3 && y.kind == 1 ) {
+      p.a.delete(n);
+    }
+    if ( x.kind == 1 && y.kind == 3 ) {
+      p.b.delete(n);
+    }
+  };
+  return p;
+};
+RdOtDelta.diff = function(a, b, caret) {
+  const la = a.length;
+  const lb = b.length;
+  let most = la;
+  if ( lb < most ) {
+    most = lb;
+  }
+  let p = 0;
+  while (p < most && a.charCodeAt(p ) == b.charCodeAt(p )) {
+    p = p + 1;
+  };
+  if ( caret >= 0 ) {
+    let grow = lb - la;
+    if ( grow < 0 ) {
+      grow = 0;
+    }
+    let lim = caret - grow;
+    if ( lim < 0 ) {
+      lim = 0;
+    }
+    if ( p > lim ) {
+      p = lim;
+    }
+  }
+  if ( (p > 0 && p < la) && RdOtDelta.isLow(a.charCodeAt(p )) ) {
+    p = p - 1;
+  }
+  if ( (p > 0 && p < lb) && RdOtDelta.isLow(b.charCodeAt(p )) ) {
+    p = p - 1;
+  }
+  let s = 0;
+  while ((s < la - p && s < lb - p) && a.charCodeAt((la - 1) - s ) == b.charCodeAt((lb - 1) - s )) {
+    s = s + 1;
+  };
+  while (s > 0 && RdOtDelta.isLow(a.charCodeAt(la - s ))) {
+    s = s - 1;
+  };
+  const d = new RdOtDelta();
+  d.retain(p);
+  d.insert(b.substring(p, lb - s ));
+  d.delete((la - p) - s);
+  d.retain(s);
+  return d;
+};
+RdOtDelta.isLow = function(c) {
+  return c >= 56320 && c <= 57343;
+};
+RdOtDelta.hex4 = function(c) {
+  const digits = "0123456789abcdef";
+  let out = "";
+  let k = 3;
+  while (k >= 0) {
+    let shift = 1;
+    let m = 0;
+    while (m < k) {
+      shift = shift * 16;
+      m = m + 1;
+    };
+    const d = ((c / shift) | 0) % 16;
+    out = out + digits.substring(d, d + 1 );
+    k = k - 1;
+  };
+  return out;
+};
+RdOtDelta.quote = function(s) {
+  let parts = [];
+  const n = s.length;
+  let start = 0;
+  let i = 0;
+  while (i < n) {
+    const c = s.charCodeAt(i );
+    let esc = "";
+    if ( c == 34 ) {
+      esc = "\\\"";
+    }
+    if ( c == 92 ) {
+      esc = "\\\\";
+    }
+    if ( c == 10 ) {
+      esc = "\\n";
+    }
+    if ( c == 13 ) {
+      esc = "\\r";
+    }
+    if ( c == 9 ) {
+      esc = "\\t";
+    }
+    if ( (c < 32 && c != 10) && (c != 13 && c != 9) ) {
+      esc = "\\u" + RdOtDelta.hex4(c);
+    }
+    if ( esc.length > 0 ) {
+      parts.push(s.substring(start, i ));
+      parts.push(esc);
+      start = i + 1;
+    }
+    i = i + 1;
+  };
+  parts.push(s.substring(start, n ));
+  return ("\"" + parts.join("")) + "\"";
+};
+RdOtDelta.fromJson = function(s) {
+  const p = new RdOtJson(s);
+  return p.delta();
+};
+export class RdOtApplied  {
+  constructor() {
+    this.ok = true;
+    this.error = "";
+    this.text = "";
+  }
+}
+export class RdOtReader  {
+  constructor(delta) {
+    this.d = undefined;
+    this.i = 0;
+    this.off = 0;
+    this.d = delta;
+  }
+  more () {
+    return this.i < this.d.ops.length;
+  };
+  kind () {
+    if ( this.i >= this.d.ops.length ) {
+      return 0;
+    }
+    const o = this.d.ops[this.i];
+    return o.kind;
+  };
+  left () {
+    if ( this.i >= this.d.ops.length ) {
+      return 0;
+    }
+    const o = this.d.ops[this.i];
+    return o.len() - this.off;
+  };
+  take (n) {
+    const o = this.d.ops[this.i];
+    const __len = o.len();
+    let k = n;
+    if ( k > __len - this.off ) {
+      k = __len - this.off;
+    }
+    const piece = RdOtOp.make(o.kind, k, "");
+    if ( o.kind == 2 ) {
+      piece.text = o.text.substring(this.off, this.off + k );
+      piece.n = 0;
+    }
+    this.off = this.off + k;
+    if ( this.off >= __len ) {
+      this.i = this.i + 1;
+      this.off = 0;
+    }
+    return piece;
+  };
+}
+export class RdOtJson  {
+  constructor(text) {
+    this.s = "";
+    this.pos = 0;
+    this.ok = true;
+    this.s = text;
+  }
+  ws () {
+    const n = this.s.length;
+    while (this.pos < n) {
+      const c = this.s.charCodeAt(this.pos );
+      if ( ((c == 32 || c == 10) || c == 13) || c == 9 ) {
+        this.pos = this.pos + 1;
+      } else {
+        return;
+      }
+    };
+  };
+  eat (c) {
+    this.ws();
+    if ( this.pos < this.s.length && this.s.charCodeAt(this.pos ) == c ) {
+      this.pos = this.pos + 1;
+      return true;
+    }
+    return false;
+  };
+  number () {
+    this.ws();
+    const n = this.s.length;
+    let v = 0;
+    let seen = false;
+    while (this.pos < n) {
+      const c = this.s.charCodeAt(this.pos );
+      if ( c >= 48 && c <= 57 ) {
+        v = v * 10 + (c - 48);
+        seen = true;
+        this.pos = this.pos + 1;
+      } else {
+        break;
+      }
+    };
+    if ( seen == false ) {
+      this.ok = false;
+    }
+    return v;
+  };
+  str () {
+    if ( this.eat(34) == false ) {
+      this.ok = false;
+      return "";
+    }
+    let parts = [];
+    const n = this.s.length;
+    let start = this.pos;
+    while (this.pos < n) {
+      const c = this.s.charCodeAt(this.pos );
+      if ( c == 34 ) {
+        parts.push(this.s.substring(start, this.pos ));
+        this.pos = this.pos + 1;
+        return parts.join("");
+      }
+      if ( c == 92 ) {
+        parts.push(this.s.substring(start, this.pos ));
+        if ( this.pos + 1 >= n ) {
+          this.ok = false;
+          return "";
+        }
+        const e = this.s.charCodeAt(this.pos + 1 );
+        this.pos = this.pos + 2;
+        if ( e == 110 ) {
+          parts.push("\n");
+        }
+        if ( e == 114 ) {
+          parts.push("\r");
+        }
+        if ( e == 116 ) {
+          parts.push("\t");
+        }
+        if ( e == 98 ) {
+          parts.push(String.fromCharCode(8));
+        }
+        if ( e == 102 ) {
+          parts.push(String.fromCharCode(12));
+        }
+        if ( (e == 34 || e == 92) || e == 47 ) {
+          parts.push(this.s.substring(this.pos - 1, this.pos ));
+        }
+        if ( e == 117 ) {
+          if ( this.pos + 4 > n ) {
+            this.ok = false;
+            return "";
+          }
+          let v = 0;
+          let k = 0;
+          while (k < 4) {
+            const h = RdOtJson.hexVal(this.s.charCodeAt(this.pos + k ));
+            if ( h < 0 ) {
+              this.ok = false;
+              return "";
+            }
+            v = v * 16 + h;
+            k = k + 1;
+          };
+          this.pos = this.pos + 4;
+          parts.push(String.fromCharCode(v));
+        }
+        start = this.pos;
+        continue;
+      }
+      this.pos = this.pos + 1;
+    };
+    this.ok = false;
+    return "";
+  };
+  delta () {
+    const d = new RdOtDelta();
+    if ( this.eat(91) == false ) {
+      this.ok = false;
+      return d;
+    }
+    if ( this.eat(93) ) {
+      return d;
+    }
+    while (this.ok) {
+      if ( this.eat(123) == false ) {
+        this.ok = false;
+        return d;
+      }
+      const key = this.str();
+      if ( this.eat(58) == false ) {
+        this.ok = false;
+        return d;
+      }
+      if ( key == "retain" ) {
+        d.retain(this.number());
+      } else {
+        if ( key == "delete" ) {
+          d.delete(this.number());
+        } else {
+          if ( key == "insert" ) {
+            d.insert(this.str());
+          } else {
+            this.ok = false;
+            return d;
+          }
+        }
+      }
+      if ( this.eat(125) == false ) {
+        this.ok = false;
+        return d;
+      }
+      if ( this.eat(93) ) {
+        return d;
+      }
+      if ( this.eat(44) == false ) {
+        this.ok = false;
+        return d;
+      }
+    };
+    return d;
+  };
+}
+RdOtJson.hexVal = function(c) {
+  if ( c >= 48 && c <= 57 ) {
+    return c - 48;
+  }
+  if ( c >= 97 && c <= 102 ) {
+    return c - 87;
+  }
+  if ( c >= 65 && c <= 70 ) {
+    return c - 55;
+  }
+  return -1;
+};
+export class RdOtClient  {
+  constructor(startRev) {
+    this.rev = 0;
+    this.outstanding = undefined;
+    this.buffer = undefined;
+    this.toSend = undefined;
+    this.rev = startRev;
+  }
+  waiting () {
+    return (typeof(this.outstanding) !== "undefined" && this.outstanding != null ) ;
+  };
+  local (d) {
+    if ( d.isNoop() ) {
+      return;
+    }
+    if ( typeof(this.outstanding) === "undefined" ) {
+      this.outstanding = d;
+      this.toSend = d;
+      return;
+    }
+    if ( typeof(this.buffer) === "undefined" ) {
+      this.buffer = d;
+      return;
+    }
+    const b = this.buffer;
+    this.buffer = b.compose(d);
+  };
+  takeSend () {
+    if ( typeof(this.toSend) === "undefined" ) {
+      return this.nothing();
+    }
+    this.toSend = this.nothing();
+    return this.outstanding;
+  };
+  nothing () {
+    let none;
+    return none;
+  };
+  ack () {
+    this.rev = this.rev + 1;
+    if ( typeof(this.buffer) === "undefined" ) {
+      this.outstanding = this.nothing();
+      return;
+    }
+    this.outstanding = this.buffer;
+    this.buffer = this.nothing();
+    this.toSend = this.outstanding;
+  };
+  resend () {
+    if ( (typeof(this.outstanding) !== "undefined" && this.outstanding != null )  ) {
+      this.toSend = this.outstanding;
+    }
+  };
+  receive (d) {
+    this.rev = this.rev + 1;
+    let server = d;
+    if ( (typeof(this.outstanding) !== "undefined" && this.outstanding != null )  ) {
+      const o = this.outstanding;
+      const p1 = RdOtDelta.transform(o, server);
+      this.outstanding = p1.a;
+      server = p1.b;
+      if ( (typeof(this.buffer) !== "undefined" && this.buffer != null )  ) {
+        const bf = this.buffer;
+        const p2 = RdOtDelta.transform(bf, server);
+        this.buffer = p2.a;
+        server = p2.b;
+      }
+    }
+    return server;
+  };
+  toLocal (at) {
+    let out = at;
+    if ( (typeof(this.outstanding) !== "undefined" && this.outstanding != null )  ) {
+      const o = this.outstanding;
+      out = o.transformIndex(out, false);
+      if ( (typeof(this.buffer) !== "undefined" && this.buffer != null )  ) {
+        const bf = this.buffer;
+        out = bf.transformIndex(out, false);
+      }
+    }
+    return out;
+  };
+}
+export class RdOtLogged  {
+  constructor() {
+    this.rev = 0;
+    this.client = "";
+    this.delta = new RdOtDelta();
+  }
+}
+export class RdOtHub  {
+  constructor(start) {
+    this.text = "";
+    this.rev = 0;
+    this.log = [];
+    this.text = start;
+  }
+  submit (at, d, client) {
+    if ( at < 0 || at > this.rev ) {
+      return false;
+    }
+    let full = d.copy();
+    let i = at;
+    while (i < this.rev) {
+      const e = this.log[i];
+      const pr = RdOtDelta.transform(full, e.delta);
+      full = pr.a;
+      i = i + 1;
+    };
+    full.padTo(this.text.length);
+    const r = full.tryApply(this.text);
+    if ( r.ok == false || full.baseLength != this.text.length ) {
+      return false;
+    }
+    this.text = r.text;
+    this.rev = this.rev + 1;
+    const e_1 = new RdOtLogged();
+    e_1.rev = this.rev;
+    e_1.client = client;
+    e_1.delta = full;
+    this.log.push(e_1);
+    return true;
+  };
+  since (at) {
+    let out = [];
+    // Loop start
+    for ( const e of this.log) {
+      if ( e.rev > at ) {
+        out.push(e);
+      }
+    }
+    return out;
+  };
+}

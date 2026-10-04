@@ -13,6 +13,7 @@ when the same presentation was edited in two places.
 | `RdPng` | PNG delta on the inflated pixel rows instead of the compressed bytes. |
 | `RdSmart` | picks the right one of the above per file. |
 | `RdText` | line diff (Myers), unified view, three-way merge (diff3) with conflict regions. |
+| `RdOt` | real-time editing: text deltas in the Quill Delta form (`retain` / `insert` / `delete`, UTF-16 lengths), apply, compose, invert, transform, caret transform, a diff that never splits a surrogate pair. `RdOtClient` is one editor's side (ot.js's client), `RdOtHub` the server's (one order, an edit on an older revision transformed over the ones since). Next to Yjs in [COLLAB.md](COLLAB.md). |
 | `RdRepo` | blobs (SHA-256), trees (path → blob + optional recipe), commits with parents. The newest version is stored whole, older ones as reverse deltas. Log, diff between commits, merge base, three-way merge of two commits. Storage is the host's: `takeDirty()` / `stored(id)` / `load(bytes)`. |
 
 Photos (JPEG): a re-encoded photo has no useful byte delta (see the
@@ -44,6 +45,7 @@ next to this one (or `RANGER_DIR=/path/to/Ranger`).
 ```
 npm test          # compile and run tests/*Tests.rgr
 npm run bench     # writes BENCHMARK.md
+npm run bench:collab  # writes COLLAB.md (RdOt next to Yjs; npm install first)
 npm run compare   # writes COMPARISON.md (xdelta3, bsdiff, zstd, git on PATH)
 npm run build     # writes dist/rangerdiff.mjs (commit it)
 npm run testdata  # regenerates testdata/xlsx and testdata/images (openpyxl, Pillow)
