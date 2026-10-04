@@ -1,0 +1,971 @@
+; SPDX-License-Identifier: MIT
+
+; ============================================================================
+; RdOt.rgr — text deltas for real-time editing (operational transformation)
+; ============================================================================
+; A delta walks the old text from the start: RETAIN n keeps n units, INSERT s
+; adds s, DELETE n drops n units. Lengths are UTF-16 code units, the way
+; JavaScript counts; in JSON it is the Quill Delta form that Yjs's
+; `Y.Text.applyDelta` also reads:
+;
+;   [{"retain":5},{"insert":"x"},{"delete":2}]
+;
+; A trailing retain is left out of the JSON (Quill's convention); `apply`
+; keeps the rest of the text as it is.
+;
+; The model is ot.js's: one server puts every edit in an order and each
+; client transforms its own not-yet-acknowledged edits over the ones the
+; server put before them (`RdOtClient`). `transform(a, b)` takes two deltas
+; made on the same text and gives a' and b' such that
+;
+;   apply(apply(S, a), b') == apply(apply(S, b), a')
+;
+; Two inserts at the same place: `a`'s goes first (the server's order: what
+; it took earlier is `a` for whoever transforms over it).
+;
+; `RdOtHub` is the server's part (check the revision, apply, keep the log),
+; the same rules the folder server runs in Go; the tests drive many clients
+; through it with random delays.
+; ============================================================================
+
+class RdOtOp {
+    ; 1 retain, 2 insert, 3 delete
+    def kind:int 0
+    def n:int 0
+    def text:string ""
+
+    Constructor () {
+    }
+
+    sfn make:RdOtOp (kind:int n:int text:string) {
+        def o:RdOtOp (new RdOtOp())
+        o.kind = kind
+        o.n = n
+        o.text = text
+        return o
+    }
+
+    fn len:int () {
+        if (kind == 2) {
+            return (strlen text)
+        }
+        return n
+    }
+}
+
+class RdOtPair {
+    def a:RdOtDelta (new RdOtDelta())
+    def b:RdOtDelta (new RdOtDelta())
+
+    Constructor () {
+    }
+}
+
+class RdOtDelta {
+    def ops:[RdOtOp]
+    ; the length of the text it applies to, and of the text it makes
+    def baseLength:int 0
+    def targetLength:int 0
+
+    Constructor () {
+    }
+
+    ; --- building (each merges with the op before it) ----------------------
+
+    fn retain:RdOtDelta (n:int) {
+        if (n <= 0) {
+            return this
+        }
+        baseLength = (baseLength + n)
+        targetLength = (targetLength + n)
+        def c:int (array_length ops)
+        if (c > 0) {
+            def last:RdOtOp (itemAt ops (c - 1))
+            if (last.kind == 1) {
+                last.n = (last.n + n)
+                return this
+            }
+        }
+        push ops (RdOtOp.make(1 n ""))
+        return this
+    }
+
+    ; an insert goes before a delete it follows: insert+delete and
+    ; delete+insert are the same edit, and one canonical form makes equal
+    ; edits equal deltas
+    fn insert:RdOtDelta (s:string) {
+        if ((strlen s) == 0) {
+            return this
+        }
+        targetLength = (targetLength + (strlen s))
+        def c:int (array_length ops)
+        if (c > 0) {
+            def last:RdOtOp (itemAt ops (c - 1))
+            if (last.kind == 2) {
+                last.text = (last.text + s)
+                return this
+            }
+            if (last.kind == 3) {
+                if (c > 1) {
+                    def prev:RdOtOp (itemAt ops (c - 2))
+                    if (prev.kind == 2) {
+                        prev.text = (prev.text + s)
+                        return this
+                    }
+                }
+                ; put it before the delete
+                def del:RdOtOp (itemAt ops (c - 1))
+                remove_index ops (c - 1)
+                push ops (RdOtOp.make(2 0 s))
+                push ops del
+                return this
+            }
+        }
+        push ops (RdOtOp.make(2 0 s))
+        return this
+    }
+
+    fn delete:RdOtDelta (n:int) {
+        if (n <= 0) {
+            return this
+        }
+        baseLength = (baseLength + n)
+        def c:int (array_length ops)
+        if (c > 0) {
+            def last:RdOtOp (itemAt ops (c - 1))
+            if (last.kind == 3) {
+                last.n = (last.n + n)
+                return this
+            }
+        }
+        push ops (RdOtOp.make(3 n ""))
+        return this
+    }
+
+    fn add:void (o:RdOtOp) {
+        if (o.kind == 1) {
+            this.retain(o.n)
+        }
+        if (o.kind == 2) {
+            this.insert(o.text)
+        }
+        if (o.kind == 3) {
+            this.delete(o.n)
+        }
+    }
+
+    ; the same delta, retaining up to `len` (a delta read from JSON has no
+    ; trailing retain; this makes it one for a text of that length)
+    fn padTo:RdOtDelta (len:int) {
+        if (baseLength < len) {
+            this.retain((len - baseLength))
+        }
+        return this
+    }
+
+    fn isNoop:boolean () {
+        for ops o:RdOtOp i {
+            if (o.kind != 1) {
+                return false
+            }
+        }
+        return true
+    }
+
+    fn copy:RdOtDelta () {
+        def d:RdOtDelta (new RdOtDelta())
+        for ops o:RdOtOp i {
+            d.add(o)
+        }
+        return d
+    }
+
+    fn equals:boolean (other:RdOtDelta) {
+        def a:RdOtDelta (this.copy())
+        def b:RdOtDelta (other.copy())
+        a.trimRetain()
+        b.trimRetain()
+        if ((array_length a.ops) != (array_length b.ops)) {
+            return false
+        }
+        def i:int 0
+        while (i < (array_length a.ops)) {
+            def x:RdOtOp (itemAt a.ops i)
+            def y:RdOtOp (itemAt b.ops i)
+            if (((x.kind != y.kind) || (x.n != y.n)) || (x.text != y.text)) {
+                return false
+            }
+            i = (i + 1)
+        }
+        return true
+    }
+
+    ; drops a trailing retain (it changes nothing)
+    fn trimRetain:void () {
+        def c:int (array_length ops)
+        if (c > 0) {
+            def last:RdOtOp (itemAt ops (c - 1))
+            if (last.kind == 1) {
+                baseLength = (baseLength - last.n)
+                targetLength = (targetLength - last.n)
+                remove_index ops (c - 1)
+            }
+        }
+    }
+
+    ; --- applying -----------------------------------------------------------
+
+    ; the new text, or "" with `ok` false on the result when the delta does
+    ; not fit (`tryApply`)
+    fn apply:string (s:string) {
+        def r:RdOtApplied (this.tryApply(s))
+        return r.text
+    }
+
+    fn tryApply:RdOtApplied (s:string) {
+        def r:RdOtApplied (new RdOtApplied())
+        def n:int (strlen s)
+        if (baseLength > n) {
+            r.ok = false
+            r.error = "the delta is for a longer text"
+            return r
+        }
+        def parts:[string]
+        def pos:int 0
+        for ops o:RdOtOp i {
+            if (o.kind == 1) {
+                push parts (substring s pos (pos + o.n))
+                pos = (pos + o.n)
+            }
+            if (o.kind == 2) {
+                push parts o.text
+            }
+            if (o.kind == 3) {
+                pos = (pos + o.n)
+            }
+        }
+        push parts (substring s pos n)
+        r.text = (join parts "")
+        return r
+    }
+
+    ; the delta that undoes this one on the text it made (`base` is the text
+    ; this one was applied to)
+    fn invert:RdOtDelta (base:string) {
+        def d:RdOtDelta (new RdOtDelta())
+        def pos:int 0
+        for ops o:RdOtOp i {
+            if (o.kind == 1) {
+                d.retain(o.n)
+                pos = (pos + o.n)
+            }
+            if (o.kind == 2) {
+                d.delete((strlen o.text))
+            }
+            if (o.kind == 3) {
+                d.insert((substring base pos (pos + o.n)))
+                pos = (pos + o.n)
+            }
+        }
+        return d
+    }
+
+    ; --- compose: this, then `b` -> one delta ----------------------------------
+
+    fn compose:RdOtDelta (b:RdOtDelta) {
+        def a:RdOtDelta (this.copy())
+        def bb:RdOtDelta (b.copy())
+        ; both must cover the middle text whole
+        if (a.targetLength < bb.baseLength) {
+            a.retain((bb.baseLength - a.targetLength))
+        }
+        bb.padTo(a.targetLength)
+        def out:RdOtDelta (new RdOtDelta())
+        def ra:RdOtReader (new RdOtReader(a))
+        def rb:RdOtReader (new RdOtReader(bb))
+        while ((ra.more()) || (rb.more())) {
+            ; a delete of a's comes first: b never saw that text
+            if ((ra.kind()) == 3) {
+                def da:RdOtOp (ra.take(ra.left()))
+                out.delete(da.n)
+                continue
+            }
+            ; an insert of b's is new text whatever a did
+            if ((rb.kind()) == 2) {
+                def ib:RdOtOp (rb.take(rb.left()))
+                out.insert(ib.text)
+                continue
+            }
+            if (((ra.more()) == false) || ((rb.more()) == false)) {
+                ; cannot happen with padded deltas; stop rather than loop
+                return out
+            }
+            def n:int (ra.left())
+            if ((rb.left()) < n) {
+                n = (rb.left())
+            }
+            def x:RdOtOp (ra.take(n))
+            def y:RdOtOp (rb.take(n))
+            if (x.kind == 1) {
+                if (y.kind == 1) {
+                    out.retain(n)
+                } {
+                    out.delete(n)
+                }
+            } {
+                ; x inserts
+                if (y.kind == 1) {
+                    out.insert(x.text)
+                }
+                ; y deletes what x inserted: nothing
+            }
+        }
+        return out
+    }
+
+    ; --- transform ----------------------------------------------------------
+
+    ; a and b on the same text -> a' (after b) and b' (after a). a's insert
+    ; goes first where both insert at one place.
+    sfn transform:RdOtPair (a0:RdOtDelta b0:RdOtDelta) {
+        def a:RdOtDelta (a0.copy())
+        def b:RdOtDelta (b0.copy())
+        def len:int a.baseLength
+        if (b.baseLength > len) {
+            len = b.baseLength
+        }
+        a.padTo(len)
+        b.padTo(len)
+        def p:RdOtPair (new RdOtPair())
+        def ra:RdOtReader (new RdOtReader(a))
+        def rb:RdOtReader (new RdOtReader(b))
+        while ((ra.more()) || (rb.more())) {
+            if ((ra.kind()) == 2) {
+                def ia:RdOtOp (ra.take(ra.left()))
+                def s:string ia.text
+                p.a.insert(s)
+                p.b.retain((strlen s))
+                continue
+            }
+            if ((rb.kind()) == 2) {
+                def ib2:RdOtOp (rb.take(rb.left()))
+                def s2:string ib2.text
+                p.a.retain((strlen s2))
+                p.b.insert(s2)
+                continue
+            }
+            if (((ra.more()) == false) || ((rb.more()) == false)) {
+                return p
+            }
+            def n:int (ra.left())
+            if ((rb.left()) < n) {
+                n = (rb.left())
+            }
+            def x:RdOtOp (ra.take(n))
+            def y:RdOtOp (rb.take(n))
+            if ((x.kind == 1) && (y.kind == 1)) {
+                p.a.retain(n)
+                p.b.retain(n)
+            }
+            if ((x.kind == 3) && (y.kind == 1)) {
+                p.a.delete(n)
+            }
+            if ((x.kind == 1) && (y.kind == 3)) {
+                p.b.delete(n)
+            }
+            ; both delete it: gone for both, nothing to do
+        }
+        return p
+    }
+
+    ; where position `at` of the old text is in the new one. `after`: an
+    ; insert exactly at `at` puts it before the position (the position's own
+    ; edit, or a caret that should stay after text typed at it).
+    fn transformIndex:int (at:int after:boolean) {
+        def pos:int 0
+        def out:int at
+        for ops o:RdOtOp i {
+            if (pos > at) {
+                return out
+            }
+            if (o.kind == 1) {
+                pos = (pos + o.n)
+            }
+            if (o.kind == 2) {
+                if ((pos < at) || ((pos == at) && after)) {
+                    out = (out + (strlen o.text))
+                }
+            }
+            if (o.kind == 3) {
+                if (pos < at) {
+                    def gone:int o.n
+                    if ((at - pos) < gone) {
+                        gone = (at - pos)
+                    }
+                    out = (out - gone)
+                }
+                pos = (pos + o.n)
+            }
+        }
+        return out
+    }
+
+    ; --- the delta between two texts ---------------------------------------
+
+    ; one replace: the common start and end kept. `caret` (-1: none) is
+    ; where the caret is in `b` after the edit; it settles a repeat ("aa" ->
+    ; "aaa": which a is new) the way the person typed it. Never splits a
+    ; surrogate pair, so each insert is whole characters.
+    sfn diff:RdOtDelta (a:string b:string caret:int) {
+        def la:int (strlen a)
+        def lb:int (strlen b)
+        def most:int la
+        if (lb < most) {
+            most = lb
+        }
+        def p:int 0
+        while ((p < most) && ((charAt a p) == (charAt b p))) {
+            p = (p + 1)
+        }
+        if (caret >= 0) {
+            def grow:int (lb - la)
+            if (grow < 0) {
+                grow = 0
+            }
+            def lim:int (caret - grow)
+            if (lim < 0) {
+                lim = 0
+            }
+            if (p > lim) {
+                p = lim
+            }
+        }
+        if ((p > 0) && (p < la) && (RdOtDelta.isLow((charAt a p)))) {
+            p = (p - 1)
+        }
+        if ((p > 0) && (p < lb) && (RdOtDelta.isLow((charAt b p)))) {
+            p = (p - 1)
+        }
+        def s:int 0
+        while (((s < (la - p)) && (s < (lb - p))) && ((charAt a ((la - 1) - s)) == (charAt b ((lb - 1) - s)))) {
+            s = (s + 1)
+        }
+        ; the kept end starts after a whole character
+        while ((s > 0) && (RdOtDelta.isLow((charAt a (la - s))))) {
+            s = (s - 1)
+        }
+        def d:RdOtDelta (new RdOtDelta())
+        d.retain(p)
+        d.insert((substring b p (lb - s)))
+        d.delete(((la - p) - s))
+        d.retain(s)
+        return d
+    }
+
+    sfn isLow:boolean (c:int) {
+        return ((c >= 56320) && (c <= 57343))
+    }
+
+    ; --- JSON ----------------------------------------------------------------
+
+    fn toJson:string () {
+        def parts:[string]
+        def c:int (array_length ops)
+        def i:int 0
+        while (i < c) {
+            def o:RdOtOp (itemAt ops i)
+            if (o.kind == 1) {
+                ; the last retain is implied
+                if (i < (c - 1)) {
+                    push parts (("{\"retain\":" + (to_string o.n)) + "}")
+                }
+            }
+            if (o.kind == 2) {
+                push parts (("{\"insert\":" + (RdOtDelta.quote(o.text))) + "}")
+            }
+            if (o.kind == 3) {
+                push parts (("{\"delete\":" + (to_string o.n)) + "}")
+            }
+            i = (i + 1)
+        }
+        return (("[" + (join parts ",")) + "]")
+    }
+
+    sfn hex4:string (c:int) {
+        def digits:string "0123456789abcdef"
+        def out:string ""
+        def k:int 3
+        while (k >= 0) {
+            def shift:int 1
+            def m:int 0
+            while (m < k) {
+                shift = (shift * 16)
+                m = (m + 1)
+            }
+            def d:int ((idiv c shift) % 16)
+            out = (out + (substring digits d (d + 1)))
+            k = (k - 1)
+        }
+        return out
+    }
+
+    sfn quote:string (s:string) {
+        def parts:[string]
+        def n:int (strlen s)
+        def start:int 0
+        def i:int 0
+        while (i < n) {
+            def c:int (charAt s i)
+            def esc:string ""
+            if (c == 34) {
+                esc = "\\\""
+            }
+            if (c == 92) {
+                esc = "\\\\"
+            }
+            if (c == 10) {
+                esc = "\\n"
+            }
+            if (c == 13) {
+                esc = "\\r"
+            }
+            if (c == 9) {
+                esc = "\\t"
+            }
+            if (((c < 32) && (c != 10)) && ((c != 13) && (c != 9))) {
+                esc = ("\\u" + (RdOtDelta.hex4(c)))
+            }
+            if ((strlen esc) > 0) {
+                push parts (substring s start i)
+                push parts esc
+                start = (i + 1)
+            }
+            i = (i + 1)
+        }
+        push parts (substring s start n)
+        return (("\"" + (join parts "")) + "\"")
+    }
+
+    ; the delta in `s` (the JSON array form); `ok` false on the parser when
+    ; it is not one
+    sfn fromJson:RdOtDelta (s:string) {
+        def p:RdOtJson (new RdOtJson(s))
+        return (p.delta())
+    }
+}
+
+class RdOtApplied {
+    def ok:boolean true
+    def error:string ""
+    def text:string ""
+
+    Constructor () {
+    }
+}
+
+; reads a delta's ops a piece at a time
+class RdOtReader {
+    def d:RdOtDelta
+    def i:int 0
+    ; how much of op i was taken already
+    def off:int 0
+
+    Constructor (delta:RdOtDelta) {
+        d = delta
+    }
+
+    fn more:boolean () {
+        return (i < (array_length d.ops))
+    }
+
+    fn kind:int () {
+        if (i >= (array_length d.ops)) {
+            return 0
+        }
+        def o:RdOtOp (itemAt d.ops i)
+        return o.kind
+    }
+
+    fn left:int () {
+        if (i >= (array_length d.ops)) {
+            return 0
+        }
+        def o:RdOtOp (itemAt d.ops i)
+        return ((o.len()) - off)
+    }
+
+    fn take:RdOtOp (n:int) {
+        def o:RdOtOp (itemAt d.ops i)
+        def len:int (o.len())
+        def k:int n
+        if (k > (len - off)) {
+            k = (len - off)
+        }
+        def piece:RdOtOp (RdOtOp.make(o.kind k ""))
+        if (o.kind == 2) {
+            piece.text = (substring o.text off (off + k))
+            piece.n = 0
+        }
+        off = (off + k)
+        if (off >= len) {
+            i = (i + 1)
+            off = 0
+        }
+        return piece
+    }
+}
+
+; the JSON array form of a delta, read without a JSON library (the host may
+; have one; this keeps the library whole on every target)
+class RdOtJson {
+    def s:string ""
+    def pos:int 0
+    def ok:boolean true
+
+    Constructor (text:string) {
+        s = text
+    }
+
+    fn ws:void () {
+        def n:int (strlen s)
+        while (pos < n) {
+            def c:int (charAt s pos)
+            if ((((c == 32) || (c == 10)) || (c == 13)) || (c == 9)) {
+                pos = (pos + 1)
+            } {
+                return
+            }
+        }
+    }
+
+    fn eat:boolean (c:int) {
+        this.ws()
+        if ((pos < (strlen s)) && ((charAt s pos) == c)) {
+            pos = (pos + 1)
+            return true
+        }
+        return false
+    }
+
+    fn number:int () {
+        this.ws()
+        def n:int (strlen s)
+        def v:int 0
+        def seen:boolean false
+        while (pos < n) {
+            def c:int (charAt s pos)
+            if ((c >= 48) && (c <= 57)) {
+                v = ((v * 10) + (c - 48))
+                seen = true
+                pos = (pos + 1)
+            } {
+                break
+            }
+        }
+        if (seen == false) {
+            ok = false
+        }
+        return v
+    }
+
+    sfn hexVal:int (c:int) {
+        if ((c >= 48) && (c <= 57)) {
+            return (c - 48)
+        }
+        if ((c >= 97) && (c <= 102)) {
+            return (c - 87)
+        }
+        if ((c >= 65) && (c <= 70)) {
+            return (c - 55)
+        }
+        return -1
+    }
+
+    fn str:string () {
+        if ((this.eat(34)) == false) {
+            ok = false
+            return ""
+        }
+        def parts:[string]
+        def n:int (strlen s)
+        def start:int pos
+        while (pos < n) {
+            def c:int (charAt s pos)
+            if (c == 34) {
+                push parts (substring s start pos)
+                pos = (pos + 1)
+                return (join parts "")
+            }
+            if (c == 92) {
+                push parts (substring s start pos)
+                if ((pos + 1) >= n) {
+                    ok = false
+                    return ""
+                }
+                def e:int (charAt s (pos + 1))
+                pos = (pos + 2)
+                if (e == 110) {
+                    push parts "\n"
+                }
+                if (e == 114) {
+                    push parts "\r"
+                }
+                if (e == 116) {
+                    push parts "\t"
+                }
+                if (e == 98) {
+                    push parts (strfromcode 8)
+                }
+                if (e == 102) {
+                    push parts (strfromcode 12)
+                }
+                if (((e == 34) || (e == 92)) || (e == 47)) {
+                    push parts (substring s (pos - 1) pos)
+                }
+                if (e == 117) {
+                    if ((pos + 4) > n) {
+                        ok = false
+                        return ""
+                    }
+                    def v:int 0
+                    def k:int 0
+                    while (k < 4) {
+                        def h:int (RdOtJson.hexVal((charAt s (pos + k))))
+                        if (h < 0) {
+                            ok = false
+                            return ""
+                        }
+                        v = ((v * 16) + h)
+                        k = (k + 1)
+                    }
+                    pos = (pos + 4)
+                    push parts (strfromcode v)
+                }
+                start = pos
+                continue
+            }
+            pos = (pos + 1)
+        }
+        ok = false
+        return ""
+    }
+
+    fn delta:RdOtDelta () {
+        def d:RdOtDelta (new RdOtDelta())
+        if ((this.eat(91)) == false) {
+            ok = false
+            return d
+        }
+        if (this.eat(93)) {
+            return d
+        }
+        while ok {
+            if ((this.eat(123)) == false) {
+                ok = false
+                return d
+            }
+            def key:string (this.str())
+            if ((this.eat(58)) == false) {
+                ok = false
+                return d
+            }
+            if (key == "retain") {
+                d.retain((this.number()))
+            } {
+                if (key == "delete") {
+                    d.delete((this.number()))
+                } {
+                    if (key == "insert") {
+                        d.insert((this.str()))
+                    } {
+                        ok = false
+                        return d
+                    }
+                }
+            }
+            if ((this.eat(125)) == false) {
+                ok = false
+                return d
+            }
+            if (this.eat(93)) {
+                return d
+            }
+            if ((this.eat(44)) == false) {
+                ok = false
+                return d
+            }
+        }
+        return d
+    }
+}
+
+; ============================================================================
+; RdOtClient — one editor's side (ot.js's client)
+; ============================================================================
+; `rev` is how many of the server's edits this one has. An edit made here
+; goes out at once when nothing is waiting for the server (`outstanding`);
+; edits made while one waits are put together in `buffer` and go when it is
+; acknowledged. An edit from the server is transformed over both and handed
+; to the editor (`receive` returns it).
+; ============================================================================
+
+class RdOtClient {
+    def rev:int 0
+    def outstanding@(optional):RdOtDelta
+    def buffer@(optional):RdOtDelta
+    ; the delta `send` should go out now (taken with `takeSend`)
+    def toSend@(optional):RdOtDelta
+
+    Constructor (startRev:int) {
+        rev = startRev
+    }
+
+    fn waiting:boolean () {
+        return (!null? outstanding)
+    }
+
+    ; the editor changed: `d` on the text as it was here
+    fn local:void (d:RdOtDelta) {
+        if (d.isNoop()) {
+            return
+        }
+        if (null? outstanding) {
+            outstanding = d
+            toSend = d
+            return
+        }
+        if (null? buffer) {
+            buffer = d
+            return
+        }
+        def b:RdOtDelta (unwrap buffer)
+        buffer = (b.compose(d))
+    }
+
+    ; what to send now, once
+    fn takeSend@(optional):RdOtDelta () {
+        def out@(optional):RdOtDelta toSend
+        toSend = (this.nothing())
+        return out
+    }
+
+    fn nothing@(optional):RdOtDelta () {
+        def none@(optional):RdOtDelta
+        return none
+    }
+
+    ; the server took this one's outstanding edit as revision rev+1
+    fn ack:void () {
+        rev = (rev + 1)
+        if (null? buffer) {
+            outstanding = (this.nothing())
+            return
+        }
+        outstanding = buffer
+        buffer = (this.nothing())
+        toSend = outstanding
+    }
+
+    ; the outstanding edit went unanswered or was refused: send it again
+    ; (after the edits it missed went through `receive`)
+    fn resend:void () {
+        if (!null? outstanding) {
+            toSend = outstanding
+        }
+    }
+
+    ; an edit of someone else's, revision rev+1 on the server -> what to apply
+    ; to the editor's text
+    fn receive:RdOtDelta (d:RdOtDelta) {
+        rev = (rev + 1)
+        def server:RdOtDelta d
+        if (!null? outstanding) {
+            def o:RdOtDelta (unwrap outstanding)
+            def p1:RdOtPair (RdOtDelta.transform(o server))
+            outstanding = p1.a
+            server = p1.b
+            if (!null? buffer) {
+                def bf:RdOtDelta (unwrap buffer)
+                def p2:RdOtPair (RdOtDelta.transform(bf server))
+                buffer = p2.a
+                server = p2.b
+            }
+        }
+        return server
+    }
+
+    ; a position in the server's text at this one's revision -> where it is
+    ; in the editor (over what is still waiting here)
+    fn toLocal:int (at:int) {
+        def out:int at
+        if (!null? outstanding) {
+            def o:RdOtDelta (unwrap outstanding)
+            out = (o.transformIndex(out false))
+            if (!null? buffer) {
+                def bf:RdOtDelta (unwrap buffer)
+                out = (bf.transformIndex(out false))
+            }
+        }
+        return out
+    }
+}
+
+; ============================================================================
+; RdOtHub — the server's part: one order for every edit
+; ============================================================================
+; An edit is taken only when it was made on the newest revision; else the
+; client gets what it missed (`since`), transforms its edit over that and
+; sends it again. The folder server (Sliqtly mcp-go/collab.go) keeps the same
+; rules.
+; ============================================================================
+
+class RdOtLogged {
+    def rev:int 0
+    def client:string ""
+    def delta:RdOtDelta (new RdOtDelta())
+
+    Constructor () {
+    }
+}
+
+class RdOtHub {
+    def text:string ""
+    def rev:int 0
+    def log:[RdOtLogged]
+
+    Constructor (start:string) {
+        text = start
+    }
+
+    ; -> true: taken as revision `rev`
+    fn submit:boolean (at:int d:RdOtDelta client:string) {
+        if (at != rev) {
+            return false
+        }
+        def full:RdOtDelta (d.copy())
+        full.padTo((strlen text))
+        def r:RdOtApplied (full.tryApply(text))
+        if ((r.ok == false) || (full.baseLength != (strlen text))) {
+            return false
+        }
+        text = r.text
+        rev = (rev + 1)
+        def e:RdOtLogged (new RdOtLogged())
+        e.rev = rev
+        e.client = client
+        e.delta = full
+        push log e
+        return true
+    }
+
+    ; the edits after revision `at`
+    fn since:[RdOtLogged] (at:int) {
+        def out:[RdOtLogged]
+        for log e:RdOtLogged i {
+            if (e.rev > at) {
+                push out e
+            }
+        }
+        return out
+    }
+}

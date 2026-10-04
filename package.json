@@ -1,7 +1,7 @@
 {
   "name": "rangerdiff",
   "version": "0.1.0",
-  "description": "Deltas and git-like versions for documents: byte deltas, segmented XLSX/ZIP deltas, PNG pixel deltas, line diff and three-way merge. Written in Ranger.",
+  "description": "Deltas and git-like versions for documents: byte deltas, segmented XLSX/ZIP deltas, PNG pixel deltas, line diff, three-way merge and real-time text deltas (OT). Written in Ranger.",
   "license": "MIT",
   "type": "module",
   "main": "dist/rangerdiff.mjs",
@@ -10,9 +10,13 @@
     "build": "node scripts/build.mjs",
     "bench": "node scripts/bench.mjs",
     "testdata": "python3 testdata/gen/make_files.py",
-    "compare": "node scripts/compare.mjs"
+    "compare": "node scripts/compare.mjs",
+    "bench:collab": "node bench/collab.mjs"
   },
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "yjs": "^13.6.33"
   }
 }
