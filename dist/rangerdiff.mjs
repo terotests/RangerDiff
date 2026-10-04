@@ -6044,9 +6044,11 @@ export class RdOtClient  {
     this.buffer = b.compose(d);
   };
   takeSend () {
-    const out = this.toSend;
+    if ( typeof(this.toSend) === "undefined" ) {
+      return this.nothing();
+    }
     this.toSend = this.nothing();
-    return out;
+    return this.outstanding;
   };
   nothing () {
     let none;
@@ -6112,10 +6114,17 @@ export class RdOtHub  {
     this.text = start;
   }
   submit (at, d, client) {
-    if ( at != this.rev ) {
+    if ( at < 0 || at > this.rev ) {
       return false;
     }
-    const full = d.copy();
+    let full = d.copy();
+    let i = at;
+    while (i < this.rev) {
+      const e = this.log[i];
+      const pr = RdOtDelta.transform(full, e.delta);
+      full = pr.a;
+      i = i + 1;
+    };
     full.padTo(this.text.length);
     const r = full.tryApply(this.text);
     if ( r.ok == false || full.baseLength != this.text.length ) {
@@ -6123,11 +6132,11 @@ export class RdOtHub  {
     }
     this.text = r.text;
     this.rev = this.rev + 1;
-    const e = new RdOtLogged();
-    e.rev = this.rev;
-    e.client = client;
-    e.delta = full;
-    this.log.push(e);
+    const e_1 = new RdOtLogged();
+    e_1.rev = this.rev;
+    e_1.client = client;
+    e_1.delta = full;
+    this.log.push(e_1);
     return true;
   };
   since (at) {

@@ -187,8 +187,8 @@ class OtTests {
         }
     }
 
-    ; `clients` editors, random edits, the hub's edits delivered late and
-    ; sends refused when stale; at the end all have the hub's text
+    ; `clients` editors, random edits, the hub's edits delivered late, so
+    ; many sends are on an old revision; at the end all have the hub's text
     sfn simulate:void (T:RdTest seed:int clients:int steps:int) {
         T.start(("simulation " + (to_string clients)) + " clients")
         def R (new RdRandom(seed))
@@ -203,7 +203,7 @@ class OtTests {
             push sims c
             i = (i + 1)
         }
-        def refused:int 0
+        def stale:int 0
         def step:int 0
         def settle:boolean false
         while true {
@@ -251,12 +251,12 @@ class OtTests {
             }
             if (what >= 6) {
                 ; what waits here goes to the hub
-                if ((c.inFlight == false) && (c.client.waiting())) {
-                    c.client.resend()
-                }
                 def out@(optional):RdOtDelta (c.client.takeSend())
                 if (!null? out) {
                     def d2:RdOtDelta (unwrap out)
+                    if (c.client.rev < hub.rev) {
+                        stale = (stale + 1)
+                    }
                     if (hub.submit(c.client.rev d2 c.id)) {
                         c.inFlight = true
                         def last:RdOtLogged (itemAt hub.log ((array_length hub.log) - 1))
@@ -264,7 +264,7 @@ class OtTests {
                             push o.inbox last
                         }
                     } {
-                        refused = (refused + 1)
+                        T.ok(false "the hub refused an edit")
                     }
                 }
             }
@@ -274,7 +274,7 @@ class OtTests {
             T.eqInt(c.client.rev hub.rev ("client " + c.id) + " has every revision")
         }
         T.ok((hub.rev > 0) "edits went through")
-        print (((((("  " + (to_string clients)) + " clients: ") + (to_string hub.rev)) + " revisions, ") + (to_string refused)) + " stale sends refused and sent again")
+        print (((((("  " + (to_string clients)) + " clients: ") + (to_string hub.rev)) + " revisions, ") + (to_string stale)) + " sent on an older revision and transformed")
     }
 
     sfn main:void () {

@@ -157,7 +157,7 @@ function together(people, editsEach, seed) {
     const hub = new RdOtHub(deck);
     const cs = Array.from({ length: people }, (_, i) => ({ id: "c" + i, text: deck, ot: new RdOtClient(0), inbox: [], flight: false, left: editsEach }));
     let wire = 0;
-    let refused = 0;
+    let stale = 0;
     let messages = 0;
     const t0 = performance.now();
     for (;;) {
@@ -182,12 +182,12 @@ function together(people, editsEach, seed) {
           }
         }
       } else {
-        if (!c.flight && c.ot.waiting()) c.ot.resend();
         const s = c.ot.takeSend();
         if (s) {
           const json = s.toJson();
           wire += bytes(json);
           messages++;
+          if (c.ot.rev < hub.rev) stale++;
           if (hub.submit(c.ot.rev, RdOtDelta.fromJson(json), c.id)) {
             c.flight = true;
             const m = { client: c.id, json: hub.log[hub.log.length - 1].delta.toJson() };
@@ -199,12 +199,12 @@ function together(people, editsEach, seed) {
               }
             }
           } else {
-            refused++;
+            throw new Error("refused");
           }
         }
       }
     }
-    res.ours = { ms: performance.now() - t0, wire, messages, refused, revs: hub.rev, same: cs.every((c) => c.text === hub.text), state: bytes(hub.text) };
+    res.ours = { ms: performance.now() - t0, wire, messages, stale, revs: hub.rev, same: cs.every((c) => c.text === hub.text), state: bytes(hub.text) };
   }
   // Yjs: each update to everyone else, in order, at random later times
   {
@@ -279,7 +279,7 @@ if (fails.length) {
 }
 if (check) {
   console.log(`ok typing: ${t.edits} edits, ours ${ms(t.ours.ms)} ms, yjs ${ms(t.yjs.ms)} ms`);
-  for (const g of groups) console.log(`ok ${g.people} people: ours ${ms(g.ours.ms)} ms (${g.ours.refused} refused), yjs ${ms(g.yjs.ms)} ms`);
+  for (const g of groups) console.log(`ok ${g.people} people: ours ${ms(g.ours.ms)} ms (${g.ours.stale} on an old revision), yjs ${ms(g.yjs.ms)} ms`);
   process.exit(0);
 }
 
@@ -315,12 +315,12 @@ L.push("| people | edits | | time | wire | messages | stale sends | state |");
 L.push("| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |");
 for (const g of groups) {
   const n = g.people * g.editsEach;
-  L.push(`| ${g.people} | ${n} | RdOt | ${ms(g.ours.ms)} ms | ${kb(g.ours.wire)} | ${g.ours.messages} | ${g.ours.refused} | ${kb(g.ours.state)} |`);
+  L.push(`| ${g.people} | ${n} | RdOt | ${ms(g.ours.ms)} ms | ${kb(g.ours.wire)} | ${g.ours.messages} | ${g.ours.stale} | ${kb(g.ours.state)} |`);
   L.push(`| | | Yjs | ${ms(g.yjs.ms)} ms | ${kb(g.yjs.wire)} | ${g.yjs.messages} | – | ${kb(g.yjs.state)} |`);
 }
 L.push("");
-L.push("\"Stale sends\": an edit sent while the person's copy was behind is refused and sent again after the missed edits (Firepad's way, which keeps the transform in the client only). " +
-  "The schedule here delays messages far more than a local network does, so this is the worst case; on the folder server the missed edits come back in the refusal itself.");
+L.push("\"Stale sends\": edits sent while the person's copy was behind; the hub transforms them over the edits taken since (ot.js's server), so none is refused or sent twice. " +
+  "The schedule here delays messages far more than a local network does, so this is the worst case.");
 L.push("");
 fs.writeFileSync(path.join(root, "COLLAB.md"), L.join("\n"));
 console.log(L.join("\n"));

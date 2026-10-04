@@ -842,11 +842,14 @@ class RdOtClient {
         buffer = (b.compose(d))
     }
 
-    ; what to send now, once
+    ; what to send now, once: the outstanding edit as it is now, on `rev`
+    ; (edits received since it was made have been taken into it)
     fn takeSend@(optional):RdOtDelta () {
-        def out@(optional):RdOtDelta toSend
+        if (null? toSend) {
+            return (this.nothing())
+        }
         toSend = (this.nothing())
-        return out
+        return outstanding
     }
 
     fn nothing@(optional):RdOtDelta () {
@@ -913,10 +916,10 @@ class RdOtClient {
 ; ============================================================================
 ; RdOtHub — the server's part: one order for every edit
 ; ============================================================================
-; An edit is taken only when it was made on the newest revision; else the
-; client gets what it missed (`since`), transforms its edit over that and
-; sends it again. The folder server (Sliqtly mcp-go/collab.go) keeps the same
-; rules.
+; An edit made on an older revision is transformed over the edits taken
+; since (ot.js's server), so a send is never refused for being late; the
+; sender takes its own edit coming back in the order as the acknowledgement.
+; The folder server (Sliqtly mcp-go/collab.go) keeps the same rules.
 ; ============================================================================
 
 class RdOtLogged {
@@ -937,12 +940,20 @@ class RdOtHub {
         text = start
     }
 
-    ; -> true: taken as revision `rev`
+    ; an edit made on revision `at` -> true: taken as revision `rev`; false:
+    ; `at` is not one of this hub's, or the edit does not fit its text
     fn submit:boolean (at:int d:RdOtDelta client:string) {
-        if (at != rev) {
+        if ((at < 0) || (at > rev)) {
             return false
         }
         def full:RdOtDelta (d.copy())
+        def i:int at
+        while (i < rev) {
+            def e:RdOtLogged (itemAt log i)
+            def pr:RdOtPair (RdOtDelta.transform(full e.delta))
+            full = pr.a
+            i = (i + 1)
+        }
         full.padTo((strlen text))
         def r:RdOtApplied (full.tryApply(text))
         if ((r.ok == false) || (full.baseLength != (strlen text))) {
