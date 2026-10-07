@@ -17,7 +17,7 @@ jobs:
           repository: terotests/Ranger
           # the compiler the committed dist/ was built with; keep it the
           # same rev as ranger.json
-          ref: 351afc770e555aa0dc2e7fa13cda5a05fe829ba8
+          ref: e3da7851bee8c7d3337fe404bef6fdc40cd34d46
           path: Ranger
       - uses: actions/setup-node@v4
         with:

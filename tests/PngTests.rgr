@@ -52,11 +52,33 @@ class PngTests {
         T.eqInt((buffer_length (inf.decompressFrom(z 2))) 0 "empty stored zlib")
     }
 
+    ; a header that claims fewer pixels than the stream holds: inflate
+    ; stops at the header's size and the delta falls back to bytes
+    sfn lying:void (T:RdTest) {
+        T.start("png header too small")
+        def base:buffer (PngTests.load("shot.png"))
+        def target:buffer (PngTests.load("shot-annotated.png"))
+        def n:int (buffer_length target)
+        def bad:buffer (buffer_alloc n)
+        (buffer_copy bad 0 target 0 n)
+        ; height 1
+        (buffer_set bad 20 0)
+        (buffer_set bad 21 0)
+        (buffer_set bad 22 0)
+        (buffer_set bad 23 1)
+        def parts:RdPngParts (RdPng.split(bad))
+        T.ok((parts.ok == false) ("refused: " + parts.error))
+        def d:buffer (RdSmart.diff(base bad))
+        def r:RdApplyResult (RdSmart.apply(base d))
+        T.ok((r.ok && (RdBytes.equal(r.data bad))) "the delta rebuilds it")
+    }
+
     sfn main:void () {
         def T (new RdTest())
         PngTests.png(T "shot-annotated.png")
         PngTests.png(T "shot-text.png")
         PngTests.smart(T)
+        PngTests.lying(T)
         T.done()
     }
 }

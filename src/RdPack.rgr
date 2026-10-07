@@ -95,9 +95,14 @@ class RdPack {
         if ((za.ok == false) || (zb.ok == false)) {
             return (RdDelta.diff(base target))
         }
-        return (RdPack.diffArchives(za zb))
+        def d:buffer (RdPack.diffArchives(za zb))
+        if ((buffer_length d) == 0) {
+            return (RdDelta.diff(base target))
+        }
+        return d
     }
 
+    ; empty when a changed part cannot be read (see RdZipEntry.bad)
     static sfn diffArchives:buffer (za:RdZipArchive zb:RdZipArchive) {
         def w (new RdWriter())
         w.byte(82)
@@ -121,12 +126,16 @@ class RdPack {
                     w.byte(0)
                 } {
                     def nb:buffer (e.content())
+                    def ob:buffer (o.content())
+                    if (e.bad || o.bad) {
+                        return (buffer_alloc 0)
+                    }
                     def sheetForm:boolean ((RdXlsx.isSheet(e.name)) && ((RdXlsx.isEncoded(nb)) == false))
                     def d:buffer (buffer_alloc 0)
                     if sheetForm {
-                        d = (RdDelta.diff((RdXlsx.encode((o.content()))) (RdXlsx.encode(nb))))
+                        d = (RdDelta.diff((RdXlsx.encode(ob)) (RdXlsx.encode(nb))))
                     } {
-                        d = (RdDelta.diff((o.content()) nb))
+                        d = (RdDelta.diff(ob nb))
                     }
                     if ((buffer_length d) < (buffer_length e.raw)) {
                         if sheetForm {
@@ -247,6 +256,10 @@ class RdPack {
                     }
                     def o2:RdZipEntry (unwrap old2)
                     def from:buffer (o2.content())
+                    if o2.bad {
+                        res.error = ("the base part cannot be read: " + name)
+                        return res
+                    }
                     if (kind == 5) {
                         from = (RdXlsx.encode(from))
                     }

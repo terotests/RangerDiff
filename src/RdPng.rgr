@@ -60,6 +60,35 @@ class RdPng {
         return true
     }
 
+    ; the most bytes the filtered pixels can take, from IHDR (the first
+    ; chunk); 0 when it is not there or not sane
+    static sfn rawSize:int (b:buffer) {
+        if (((buffer_length b) < 33) || ((RdPng.isType(b 12 "IHDR")) == false)) {
+            return 0
+        }
+        def w:int (RdPng.u32be(b 16))
+        def h:int (RdPng.u32be(b 20))
+        def depth:int (buffer_get b 24)
+        def color:int (buffer_get b 25)
+        def channels:int 1
+        if (color == 2) {
+            channels = 3
+        }
+        if (color == 4) {
+            channels = 2
+        }
+        if (color == 6) {
+            channels = 4
+        }
+        if ((((w <= 0) || (h <= 0)) || ((w > 100000) || (h > 100000))) || ((depth <= 0) || (depth > 16))) {
+            return 0
+        }
+        ; at most two bytes a sample (16-bit depth)
+        def row:int ((w * channels) * 2)
+        ; interlaced: seven passes, each row with its own filter byte
+        return ((((row + 1) * h) * 2) + 1024)
+    }
+
     static sfn split:RdPngParts (b:buffer) {
         def parts (new RdPngParts())
         if ((RdPng.isPng(b)) == false) {
@@ -102,7 +131,17 @@ class RdPng {
             return parts
         }
         def inf (new Inflate())
+        ; never more than the image header says the pixels take
+        inf.maxOutput = (RdPng.rawSize(b))
+        if (inf.maxOutput <= 0) {
+            parts.error = "broken IHDR"
+            return parts
+        }
         parts.pixels = (inf.decompressFrom(z 2))
+        if (((strlen inf.error) > 0) || inf.truncated) {
+            parts.error = ("broken pixels: " + inf.error)
+            return parts
+        }
         parts.skeleton = (skel.toBuffer())
         parts.ok = true
         return parts

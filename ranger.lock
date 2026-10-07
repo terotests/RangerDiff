@@ -3,15 +3,15 @@
   "packages": {
     "zip": {
       "git": "https://github.com/terotests/Ranger.git",
-      "rev": "351afc770e555aa0dc2e7fa13cda5a05fe829ba8",
+      "rev": "e3da7851bee8c7d3337fe404bef6fdc40cd34d46",
       "subdir": "lib/zip",
-      "sha256": "c9a617acbc94bddbc56eac40ed9947815f1398eb0890fd2932f5d1b5e810a625"
+      "sha256": "b0ae94859e9e9a82013c1035bf36ada70d931ddb5ed16dd495028820d925ca9e"
     },
     "core": {
       "git": "https://github.com/terotests/Ranger.git",
-      "rev": "351afc770e555aa0dc2e7fa13cda5a05fe829ba8",
+      "rev": "e3da7851bee8c7d3337fe404bef6fdc40cd34d46",
       "subdir": "lib/core",
-      "sha256": "97586bc6a2b3870e24cb59939c46fca61eb5d00ecddce429f5d9496c93f40572"
+      "sha256": "13e58a076b4a0e7f0c99a7464e0b084fa49463e10b21d8fae6c09e33464ade65"
     }
   }
 }
