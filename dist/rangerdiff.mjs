@@ -1685,6 +1685,12 @@ export class ZipBuffer  {
     return ((b0 + b1 * 256) + b2 * 65536) + b3 * 16777216;
   };
   readBytes (count) {
+    if ( count > this.length - this.pos ) {
+      count = this.length - this.pos;
+    }
+    if ( count < 0 ) {
+      count = 0;
+    }
     let result = (function(b){ return Object.assign(b, { _view: new DataView(b) }); })(new ArrayBuffer(count));
     let i = 0;
     while (i < count) {
@@ -2004,6 +2010,7 @@ export class InflateBitReader  {
     this.bitPos = 0;
     this.currentByte = 0;
     this.dataLength = 0;
+    this.overrun = false;
   }
   init (buf, offset, length) {
     this.data = buf;
@@ -2011,10 +2018,12 @@ export class InflateBitReader  {
     this.dataLength = offset + length;
     this.bitPos = 0;
     this.currentByte = 0;
+    this.overrun = false;
   };
   readBit () {
     if ( this.bitPos == 0 ) {
       if ( this.bytePos >= this.dataLength ) {
+        this.overrun = true;
         return 0;
       }
       this.currentByte = this.data._view.getUint8(this.bytePos);
@@ -2044,6 +2053,7 @@ export class InflateBitReader  {
   readByte () {
     this.alignToByte();
     if ( this.bytePos >= this.dataLength ) {
+      this.overrun = true;
       return 0;
     }
     const b = this.data._view.getUint8(this.bytePos);
@@ -2069,6 +2079,9 @@ export class Inflate  {
     this.outBuf = (function(b){ return Object.assign(b, { _view: new DataView(b) }); })(new ArrayBuffer(0));
     this.outLen = 0;
     this.outCap = 0;
+    this.maxOutput = 0;
+    this.error = "";
+    this.truncated = false;
     this.fixedLitLen = new InflateHuffmanTable();
     this.fixedDist = new InflateHuffmanTable();
     this.fixedTablesBuilt = false;
@@ -2083,18 +2096,36 @@ export class Inflate  {
     if ( cap < 4096 ) {
       cap = 4096;
     }
+    if ( this.maxOutput > 0 && cap > this.maxOutput ) {
+      cap = this.maxOutput;
+    }
     this.outBuf = (function(b){ return Object.assign(b, { _view: new DataView(b) }); })(new ArrayBuffer(cap));
     this.outCap = cap;
     this.outLen = 0;
   };
+  fail (why) {
+    if ( this.error.length == 0 ) {
+      this.error = why;
+    }
+  };
+  going () {
+    return this.error.length == 0 && this.reader.overrun == false;
+  };
   ensureCapacity (extra) {
     const need = this.outLen + extra;
+    if ( this.maxOutput > 0 && need > this.maxOutput ) {
+      this.fail(("output larger than " + (this.maxOutput.toString())) + " bytes");
+      return false;
+    }
     if ( need <= this.outCap ) {
-      return;
+      return true;
     }
     let newCap = this.outCap * 2;
     if ( newCap < need ) {
       newCap = need;
+    }
+    if ( this.maxOutput > 0 && newCap > this.maxOutput ) {
+      newCap = this.maxOutput;
     }
     let grown = (function(b){ return Object.assign(b, { _view: new DataView(b) }); })(new ArrayBuffer(newCap));
     (function(
@@ -2106,9 +2137,12 @@ export class Inflate  {
     ){ var dv = new Uint8Array(d); var sv = new Uint8Array(s); for(var i=0;i<len;i++) dv[dOff+i]=sv[sOff+i]; })(grown,0,this.outBuf,0,this.outLen);
     this.outBuf = grown;
     this.outCap = newCap;
+    return true;
   };
   pushByte (b) {
-    this.ensureCapacity(1);
+    if ( this.ensureCapacity(1) == false ) {
+      return;
+    }
     this.outBuf._view.setUint8(this.outLen, b);
     this.outLen = this.outLen + 1;
   };
@@ -2289,6 +2323,8 @@ export class Inflate  {
   };
   decompressFrom (data, offset) {
     this.input = data;
+    this.error = "";
+    this.truncated = false;
     const dataLen = data.byteLength;
     let from = offset;
     if ( from < 0 ) {
@@ -2302,7 +2338,7 @@ export class Inflate  {
     this.reader.init(data, from, rest);
     this.buildFixedTables();
     let finalBlock = false;
-    while (false == finalBlock) {
+    while (false == finalBlock && this.going()) {
       const bfinal = this.reader.readBit();
       const btype = this.reader.readBits(2);
       finalBlock = bfinal == 1;
@@ -2315,7 +2351,15 @@ export class Inflate  {
       if ( btype == 2 ) {
         this.decompressDynamic();
       }
+      if ( btype == 3 ) {
+        this.fail("reserved block type");
+      }
     };
+    if ( this.error.length > 0 ) {
+      this.outLen = 0;
+      return (function(b){ return Object.assign(b, { _view: new DataView(b) }); })(new ArrayBuffer(0));
+    }
+    this.truncated = this.reader.overrun;
     return this.finalOutput();
   };
   inputPos () {
@@ -2326,10 +2370,16 @@ export class Inflate  {
     const __len = this.reader.readUint16LE();
     const nlen = this.reader.readUint16LE();
     if ( __len + nlen != 65535 ) {
+      if ( this.reader.overrun == false ) {
+        this.fail("stored block length does not match its complement");
+      }
+      return;
     }
-    this.ensureCapacity(__len);
+    if ( this.ensureCapacity(__len) == false ) {
+      return;
+    }
     let i = 0;
-    while (i < __len) {
+    while (i < __len && this.going()) {
       const b = this.reader.readByte();
       this.pushByte(b);
       i = i + 1;
@@ -2337,8 +2387,15 @@ export class Inflate  {
   };
   decompressHuffman (litLenTable, distTable) {
     let done = false;
-    while (false == done) {
+    while (false == done && this.going()) {
       const sym = litLenTable.decode(this.reader);
+      if ( this.reader.overrun ) {
+        return;
+      }
+      if ( sym < 0 || sym > 285 ) {
+        this.fail("invalid literal/length code");
+        return;
+      }
       if ( sym < 256 ) {
         this.pushByte(sym);
       }
@@ -2353,10 +2410,21 @@ export class Inflate  {
           length = length + this.reader.readBits(extraBits);
         }
         const distCode = distTable.decode(this.reader);
+        if ( distCode < 0 || distCode > 29 ) {
+          this.fail("invalid distance code");
+          return;
+        }
         let dist = this.distBase[distCode];
         const distExtraBits = this.distExtra[distCode];
         if ( distExtraBits > 0 ) {
           dist = dist + this.reader.readBits(distExtraBits);
+        }
+        if ( this.reader.overrun ) {
+          return;
+        }
+        if ( dist > this.outLen ) {
+          this.fail("distance before the start of the output");
+          return;
         }
         this.copyFromOutput(dist, length);
       }
@@ -2404,8 +2472,12 @@ export class Inflate  {
     let allLengths = [];
     const totalCodes = hlit + hdist;
     i = 0;
-    while (i < totalCodes) {
+    while (i < totalCodes && this.going()) {
       const sym = clTable.decode(this.reader);
+      if ( sym < 0 || sym > 18 ) {
+        this.fail("invalid code length code");
+        return;
+      }
       if ( sym < 16 ) {
         allLengths.push(sym);
         i = i + 1;
@@ -2443,6 +2515,13 @@ export class Inflate  {
         i = i + repeat_2;
       }
     };
+    if ( this.going() == false ) {
+      return;
+    }
+    if ( i > totalCodes ) {
+      this.fail("code lengths run past the table");
+      return;
+    }
     let litLenLengths = [];
     let distLengths = [];
     i = 0;
@@ -2462,7 +2541,9 @@ export class Inflate  {
   };
   copyFromOutput (distance, length) {
     const srcPos = this.outLen - distance;
-    this.ensureCapacity(length);
+    if ( this.ensureCapacity(length) == false ) {
+      return;
+    }
     let i = 0;
     while (i < length) {
       let b = 0;
@@ -2488,6 +2569,7 @@ export class RdZipEntry  {
     this.raw = (function(b){ return Object.assign(b, { _view: new DataView(b) }); })(new ArrayBuffer(0));
     this.hasContent = false;
     this.contentBuf = (function(b){ return Object.assign(b, { _view: new DataView(b) }); })(new ArrayBuffer(0));
+    this.bad = false;
   }
   content () {
     if ( this.hasContent ) {
@@ -2495,7 +2577,12 @@ export class RdZipEntry  {
     }
     if ( this.method == 8 ) {
       const inf = new Inflate();
+      inf.maxOutput = this.usize;
       this.contentBuf = inf.decompress(this.raw);
+      if ( (inf.error.length > 0 || inf.truncated) || this.contentBuf.byteLength != this.usize ) {
+        this.bad = true;
+        this.contentBuf = (function(b){ return Object.assign(b, { _view: new DataView(b) }); })(new ArrayBuffer(0));
+      }
     } else {
       this.contentBuf = this.raw;
     }
@@ -2585,7 +2672,7 @@ RdZip.read = function(b) {
   let i = 0;
   let at = cd;
   while (i < count) {
-    if ( at + 46 > n || RdZip.u32(b, at) != 33639248 ) {
+    if ( (at < 0 || at + 46 > n) || RdZip.u32(b, at) != 33639248 ) {
       z.error = "broken central directory";
       return z;
     }
@@ -2598,6 +2685,14 @@ RdZip.read = function(b) {
     const extraLen = RdZip.u16(b, (at + 30));
     const commentLen = RdZip.u16(b, (at + 32));
     const local = RdZip.u32(b, (at + 42));
+    if ( ((e.csize < 0 || e.usize < 0) || local < 0) || ((e.csize == 4294967295 || e.usize == 4294967295) || local == 4294967295) ) {
+      z.error = "ZIP64 is not supported";
+      return z;
+    }
+    if ( (at + 46) + nameLen > n ) {
+      z.error = "broken central directory";
+      return z;
+    }
     e.name = RdBytes.toText(((function(
       b,
       s,
@@ -3520,7 +3615,11 @@ RdPack.diff = function(base, target) {
   if ( za.ok == false || zb.ok == false ) {
     return RdDelta.diff(base, target);
   }
-  return RdPack.diffArchives(za, zb);
+  const d = RdPack.diffArchives(za, zb);
+  if ( d.byteLength == 0 ) {
+    return RdDelta.diff(base, target);
+  }
+  return d;
 };
 RdPack.diffArchives = function(za, zb) {
   const w = new RdWriter();
@@ -3532,7 +3631,7 @@ RdPack.diffArchives = function(za, zb) {
   let byCrc = {};
   // Loop start
   for ( const ea of za.entries) {
-    const key = ((ea.crc).toString()) + (":" + ((ea.usize).toString()));
+    const key = (ea.crc.toString()) + (":" + (ea.usize.toString()));
     byCrc[key] = ea.name;
   }
   // Loop start
@@ -3546,12 +3645,16 @@ RdPack.diffArchives = function(za, zb) {
         w.byte(0);
       } else {
         const nb = e.content();
+        const ob = o.content();
+        if ( e.bad || o.bad ) {
+          return (function(b){ return Object.assign(b, { _view: new DataView(b) }); })(new ArrayBuffer(0));
+        }
         const sheetForm = RdXlsx.isSheet(e.name) && RdXlsx.isEncoded(nb) == false;
         let d = (function(b){ return Object.assign(b, { _view: new DataView(b) }); })(new ArrayBuffer(0));
         if ( sheetForm ) {
-          d = RdDelta.diff(RdXlsx.encode(o.content()), RdXlsx.encode(nb));
+          d = RdDelta.diff(RdXlsx.encode(ob), RdXlsx.encode(nb));
         } else {
-          d = RdDelta.diff(o.content(), nb);
+          d = RdDelta.diff(ob, nb);
         }
         if ( d.byteLength < e.raw.byteLength ) {
           if ( sheetForm ) {
@@ -3566,7 +3669,7 @@ RdPack.diffArchives = function(za, zb) {
         }
       }
     } else {
-      const key2 = ((e.crc).toString()) + (":" + ((e.usize).toString()));
+      const key2 = (e.crc.toString()) + (":" + (e.usize.toString()));
       if ( ( typeof(byCrc[key2] ) != "undefined" && Object.prototype.hasOwnProperty.call(byCrc, key2) ) ) {
         w.byte(3);
         w.text(( Object.prototype.hasOwnProperty.call(byCrc, key2) ? byCrc[key2] : undefined ));
@@ -3669,6 +3772,10 @@ RdPack.apply = function(base, delta) {
         }
         const o2 = old2;
         let from = o2.content();
+        if ( o2.bad ) {
+          res.error = "the base part cannot be read: " + name;
+          return res;
+        }
         if ( kind == 5 ) {
           from = RdXlsx.encode(from);
         }
@@ -3810,6 +3917,30 @@ RdPng.isType = function(b, p, t) {
   };
   return true;
 };
+RdPng.rawSize = function(b) {
+  if ( b.byteLength < 33 || RdPng.isType(b, 12, "IHDR") == false ) {
+    return 0;
+  }
+  const w = RdPng.u32be(b, 16);
+  const h = RdPng.u32be(b, 20);
+  const depth = b._view.getUint8(24);
+  const color = b._view.getUint8(25);
+  let channels = 1;
+  if ( color == 2 ) {
+    channels = 3;
+  }
+  if ( color == 4 ) {
+    channels = 2;
+  }
+  if ( color == 6 ) {
+    channels = 4;
+  }
+  if ( ((w <= 0 || h <= 0) || (w > 100000 || h > 100000)) || (depth <= 0 || depth > 16) ) {
+    return 0;
+  }
+  const row = (w * channels) * 2;
+  return ((row + 1) * h) * 2 + 1024;
+};
 RdPng.split = function(b) {
   const parts = new RdPngParts();
   if ( RdPng.isPng(b) == false ) {
@@ -3851,7 +3982,16 @@ RdPng.split = function(b) {
     return parts;
   }
   const inf = new Inflate();
+  inf.maxOutput = RdPng.rawSize(b);
+  if ( inf.maxOutput <= 0 ) {
+    parts.error = "broken IHDR";
+    return parts;
+  }
   parts.pixels = inf.decompressFrom(z, 2);
+  if ( inf.error.length > 0 || inf.truncated ) {
+    parts.error = "broken pixels: " + inf.error;
+    return parts;
+  }
   parts.skeleton = skel.toBuffer();
   parts.ok = true;
   return parts;
@@ -4540,7 +4680,7 @@ export class RdTree  {
     let lines = [];
     // Loop start
     for ( const e of this.entries) {
-      let l = (((e.path + "\t") + e.blob) + "\t") + ((e.size).toString());
+      let l = (((e.path + "\t") + e.blob) + "\t") + (e.size.toString());
       if ( e.recipe.length > 0 ) {
         l = (l + "\t") + e.recipe;
       }
@@ -5624,14 +5764,14 @@ export class RdOtDelta  {
       const o = this.ops[i];
       if ( o.kind == 1 ) {
         if ( i < c - 1 ) {
-          parts.push(("{\"retain\":" + ((o.n).toString())) + "}");
+          parts.push(("{\"retain\":" + (o.n.toString())) + "}");
         }
       }
       if ( o.kind == 2 ) {
         parts.push(("{\"insert\":" + RdOtDelta.quote(o.text)) + "}");
       }
       if ( o.kind == 3 ) {
-        parts.push(("{\"delete\":" + ((o.n).toString())) + "}");
+        parts.push(("{\"delete\":" + (o.n.toString())) + "}");
       }
       i = i + 1;
     };

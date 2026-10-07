@@ -3,6 +3,7 @@
 ; Run from the repository root.
 
 Import "../src/RdPack.rgr"
+Import "../src/RdSmart.rgr"
 Import "RdTest.rgr"
 
 class PackTests {
@@ -98,6 +99,103 @@ class PackTests {
         T.ok((r2.ok == false) "a truncated delta is refused")
     }
 
+    sfn copyOf:buffer (b:buffer) {
+        def n:int (buffer_length b)
+        def c:buffer (buffer_alloc n)
+        (buffer_copy c 0 b 0 n)
+        return c
+    }
+
+    ; where the first central directory entry (PK 1 2) starts
+    sfn firstCd:int (b:buffer) {
+        def p:int 0
+        while ((p + 4) <= (buffer_length b)) {
+            if ((((buffer_get b p) == 80) && ((buffer_get b (p + 1)) == 75)) && (((buffer_get b (p + 2)) == 1) && ((buffer_get b (p + 3)) == 2))) {
+                return p
+            }
+            p = (p + 1)
+        }
+        return -1
+    }
+
+    ; a delta still rebuilds the target byte for byte
+    sfn roundTrip:void (T:RdTest base:buffer target:buffer what:string) {
+        def d:buffer (RdSmart.diff(base target))
+        def r:RdApplyResult (RdSmart.apply(base d))
+        T.ok((r.ok && (RdBytes.equal(r.data target))) what)
+    }
+
+    ; archives that cannot be read whole: no crash, no endless inflate, and
+    ; the delta falls back to bytes
+    sfn broken:void (T:RdTest) {
+        T.start("broken archives")
+        def base:buffer (PackTests.load("base.xlsx"))
+        def target:buffer (PackTests.load("edit-cell.xlsx"))
+        def z:RdZipArchive (RdZip.read(target))
+        ; a deflate stream cut short
+        def cut:[RdZipEntry]
+        ; a part that claims to be smaller than it inflates to (a zip bomb)
+        def small:[RdZipEntry]
+        for z.entries e:RdZipEntry i {
+            def c (new RdZipEntry())
+            c.name = e.name
+            c.method = e.method
+            c.crc = e.crc
+            c.usize = e.usize
+            c.raw = e.raw
+            def s (new RdZipEntry())
+            s.name = e.name
+            s.method = e.method
+            s.crc = e.crc
+            s.usize = e.usize
+            s.raw = e.raw
+            if ((e.name == "xl/worksheets/sheet1.xml") && (e.method == 8)) {
+                c.raw = (buffer_slice e.raw 0 20)
+                s.usize = 10
+            }
+            push cut c
+            push small s
+        }
+        def cutZip:buffer (RdZip.write(cut))
+        def zc:RdZipArchive (RdZip.read(cutZip))
+        def sheet@(optional):RdZipEntry (zc.find("xl/worksheets/sheet1.xml"))
+        if (!null? sheet) {
+            def se:RdZipEntry (unwrap sheet)
+            se.content()
+            T.ok(se.bad "a cut part is bad")
+        }
+        PackTests.roundTrip(T base cutZip "cut part: the delta rebuilds it")
+        PackTests.roundTrip(T cutZip base "cut part as the base: the delta rebuilds the target")
+        def smallZip:buffer (RdZip.write(small))
+        def zs:RdZipArchive (RdZip.read(smallZip))
+        def sheet2@(optional):RdZipEntry (zs.find("xl/worksheets/sheet1.xml"))
+        if (!null? sheet2) {
+            def se2:RdZipEntry (unwrap sheet2)
+            T.eqInt((buffer_length (se2.content())) 0 "inflate stops at the size the archive gives")
+            T.ok(se2.bad "an oversized part is bad")
+        }
+        PackTests.roundTrip(T base smallZip "oversized part: the delta rebuilds it")
+        ; a name that runs past the end of the file
+        def at:int (PackTests.firstCd(target))
+        T.ok((at > 0) "finds the central directory")
+        def longName:buffer (PackTests.copyOf(target))
+        (buffer_set longName (at + 28) 255)
+        (buffer_set longName (at + 29) 255)
+        T.ok(((RdZip.read(longName)).ok == false) "a name past the end is refused")
+        PackTests.roundTrip(T base longName "a name past the end: byte delta")
+        ; ZIP64 sizes
+        def z64:buffer (PackTests.copyOf(target))
+        (buffer_set z64 (at + 20) 255)
+        (buffer_set z64 (at + 21) 255)
+        (buffer_set z64 (at + 22) 255)
+        (buffer_set z64 (at + 23) 255)
+        def r64:RdZipArchive (RdZip.read(z64))
+        T.ok((r64.ok == false) "ZIP64 is refused")
+        T.eqStr(r64.error "ZIP64 is not supported" "says why")
+        PackTests.roundTrip(T base z64 "ZIP64: byte delta")
+        PackTests.roundTrip(T z64 base "ZIP64 as the base: byte delta")
+    }
+
     sfn main:void () {
         def T (new RdTest())
         PackTests.zip(T)
@@ -109,6 +207,7 @@ class PackTests {
         PackTests.edit(T "style-header.xlsx" 1500)
         PackTests.edit(T "edit-column.xlsx" 16000)
         PackTests.damage(T)
+        PackTests.broken(T)
         T.done()
     }
 }

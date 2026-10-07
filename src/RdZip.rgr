@@ -24,6 +24,9 @@ class RdZipEntry {
     def raw:buffer (buffer_alloc 0)
     def hasContent:boolean false
     def contentBuf:buffer (buffer_alloc 0)
+    ; content() could not get the part's bytes: the deflate stream is
+    ; broken, cut short or longer than the size the archive gives
+    def bad:boolean false
 
     Constructor () {
     }
@@ -35,7 +38,13 @@ class RdZipEntry {
         }
         if (method == 8) {
             def inf (new Inflate())
+            ; never more than the archive says the part holds (a zip bomb)
+            inf.maxOutput = usize
             contentBuf = (inf.decompress(raw))
+            if ((((strlen inf.error) > 0) || inf.truncated) || ((buffer_length contentBuf) != usize)) {
+                bad = true
+                contentBuf = (buffer_alloc 0)
+            }
         } {
             contentBuf = raw
         }
@@ -131,7 +140,7 @@ class RdZip {
         def i:int 0
         def at:int cd
         while (i < count) {
-            if (((at + 46) > n) || ((RdZip.u32(b at)) != 33639248)) {
+            if ((((at < 0) || ((at + 46) > n))) || ((RdZip.u32(b at)) != 33639248)) {
                 z.error = "broken central directory"
                 return z
             }
@@ -144,6 +153,17 @@ class RdZip {
             def extraLen:int (RdZip.u16(b (at + 30)))
             def commentLen:int (RdZip.u16(b (at + 32)))
             def local:int (RdZip.u32(b (at + 42)))
+            ; ZIP64 keeps the real sizes and offset in an extra field: not
+            ; read. Its 0xFFFFFFFF markers (and any value from 2 GB up) come
+            ; out of u32 as negative, or as 4294967295 where int is 64-bit.
+            if ((((e.csize < 0) || (e.usize < 0)) || (local < 0)) || (((e.csize == 4294967295) || (e.usize == 4294967295)) || (local == 4294967295))) {
+                z.error = "ZIP64 is not supported"
+                return z
+            }
+            if (((at + 46) + nameLen) > n) {
+                z.error = "broken central directory"
+                return z
+            }
             e.name = (RdBytes.toText((buffer_slice b (at + 46) ((at + 46) + nameLen))))
             if ((e.method != 0) && (e.method != 8)) {
                 z.error = ("unsupported compression in " + e.name)

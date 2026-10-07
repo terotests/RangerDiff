@@ -5,12 +5,12 @@
   "dependencies": {
     "zip": {
       "git": "https://github.com/terotests/Ranger.git",
-      "rev": "351afc770e555aa0dc2e7fa13cda5a05fe829ba8",
+      "rev": "e3da7851bee8c7d3337fe404bef6fdc40cd34d46",
       "subdir": "lib/zip"
     },
     "core": {
       "git": "https://github.com/terotests/Ranger.git",
-      "rev": "351afc770e555aa0dc2e7fa13cda5a05fe829ba8",
+      "rev": "e3da7851bee8c7d3337fe404bef6fdc40cd34d46",
       "subdir": "lib/core"
     }
   }
