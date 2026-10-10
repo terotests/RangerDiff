@@ -2114,7 +2114,7 @@ export class Inflate  {
   ensureCapacity (extra) {
     const need = this.outLen + extra;
     if ( this.maxOutput > 0 && need > this.maxOutput ) {
-      this.fail(("output larger than " + ((this.maxOutput).toString())) + " bytes");
+      this.fail(("output larger than " + (this.maxOutput.toString())) + " bytes");
       return false;
     }
     if ( need <= this.outCap ) {
@@ -3631,7 +3631,7 @@ RdPack.diffArchives = function(za, zb) {
   let byCrc = {};
   // Loop start
   for ( const ea of za.entries) {
-    const key = ((ea.crc).toString()) + (":" + ((ea.usize).toString()));
+    const key = (ea.crc.toString()) + (":" + (ea.usize.toString()));
     byCrc[key] = ea.name;
   }
   // Loop start
@@ -3669,7 +3669,7 @@ RdPack.diffArchives = function(za, zb) {
         }
       }
     } else {
-      const key2 = ((e.crc).toString()) + (":" + ((e.usize).toString()));
+      const key2 = (e.crc.toString()) + (":" + (e.usize.toString()));
       if ( ( typeof(byCrc[key2] ) != "undefined" && Object.prototype.hasOwnProperty.call(byCrc, key2) ) ) {
         w.byte(3);
         w.text(( Object.prototype.hasOwnProperty.call(byCrc, key2) ? byCrc[key2] : undefined ));
@@ -4680,7 +4680,7 @@ export class RdTree  {
     let lines = [];
     // Loop start
     for ( const e of this.entries) {
-      let l = (((e.path + "\t") + e.blob) + "\t") + ((e.size).toString());
+      let l = (((e.path + "\t") + e.blob) + "\t") + (e.size.toString());
       if ( e.recipe.length > 0 ) {
         l = (l + "\t") + e.recipe;
       }
@@ -5764,14 +5764,14 @@ export class RdOtDelta  {
       const o = this.ops[i];
       if ( o.kind == 1 ) {
         if ( i < c - 1 ) {
-          parts.push(("{\"retain\":" + ((o.n).toString())) + "}");
+          parts.push(("{\"retain\":" + (o.n.toString())) + "}");
         }
       }
       if ( o.kind == 2 ) {
         parts.push(("{\"insert\":" + RdOtDelta.quote(o.text)) + "}");
       }
       if ( o.kind == 3 ) {
-        parts.push(("{\"delete\":" + ((o.n).toString())) + "}");
+        parts.push(("{\"delete\":" + (o.n.toString())) + "}");
       }
       i = i + 1;
     };
@@ -6576,7 +6576,7 @@ RdPatch.parse = function(text) {
       }
       if ( oldSeen < h.oldLen || newSeen < h.newLen ) {
         let msg = (("hunk " + ((hi + 1).toString())) + ": patch ends early: ") + s;
-        msg = ((((msg + " (") + ((oldSeen).toString())) + " old and ") + ((newSeen).toString())) + " new lines)";
+        msg = ((((msg + " (") + (oldSeen.toString())) + " old and ") + (newSeen.toString())) + " new lines)";
         pf.errors.push(msg);
         return pf;
       }
@@ -6807,7 +6807,7 @@ RdPatch.fail = function(res, hi, line, expected, got, msg) {
   res.line = line;
   res.expected = expected;
   res.got = got;
-  res.message = ((("hunk " + ((hi + 1).toString())) + ", line ") + ((line).toString())) + (": " + msg);
+  res.message = ((("hunk " + ((hi + 1).toString())) + ", line ") + (line.toString())) + (": " + msg);
 };
 RdPatch.range = function(start, lines) {
   const r = new RdPatchRange();
