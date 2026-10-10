@@ -27,6 +27,14 @@ jobs:
         env:
           RANGER_DIR: ${{ github.workspace }}/Ranger
         run: npm test
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Real-time editing tests on Go
+        working-directory: RangerDiff
+        env:
+          RANGER_DIR: ${{ github.workspace }}/Ranger
+        run: npm run test:go
       - name: Real-time editing converges, next to Yjs
         working-directory: RangerDiff
         run: |

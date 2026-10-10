@@ -7,7 +7,7 @@ Import "RdTest.rgr"
 
 class OtSim {
     def id:string ""
-    def text:string ""
+    def text:RdOtStr (ot_of "")
     def client:RdOtClient (new RdOtClient(0))
     ; the hub's edits not yet delivered here, in order
     def inbox:[RdOtLogged]
@@ -23,7 +23,7 @@ class OtTests {
         return ([] _:string ("a" "b" "xy" " " "\n" "## " "ä" "😀" "👨‍👩‍👧" "\"q\"" "\\"))
     }
 
-    sfn randomString:string (R:RdRandom n:int) {
+    sfn randomString:RdOtStr (R:RdRandom n:int) {
         def ps:[string] (OtTests.pieces())
         def out:string ""
         def i:int 0
@@ -31,13 +31,13 @@ class OtTests {
             out = (out + (itemAt ps (R.below((array_length ps)))))
             i = (i + 1)
         }
-        return out
+        return (ot_of out)
     }
 
     ; a random edit of `s`: a few replaces at random places, cut at whole
     ; characters (as an editor makes them)
-    sfn randomDelta:RdOtDelta (R:RdRandom s:string) {
-        def n:int (strlen s)
+    sfn randomDelta:RdOtDelta (R:RdRandom s:RdOtStr) {
+        def n:int (ot_len s)
         def d:RdOtDelta (new RdOtDelta())
         def pos:int 0
         def edits:int (1 + (R.below(3)))
@@ -69,9 +69,9 @@ class OtTests {
     }
 
     ; `at` moved back off the low half of a surrogate pair
-    sfn whole:int (s:string at:int) {
-        if ((at > 0) && (at < (strlen s))) {
-            if (RdOtDelta.isLow((charAt s at))) {
+    sfn whole:int (s:RdOtStr at:int) {
+        if ((at > 0) && (at < (ot_len s))) {
+            if (RdOtDelta.isLow((ot_at s at))) {
                 return (at - 1)
             }
         }
@@ -80,29 +80,29 @@ class OtTests {
 
     sfn basics:void (T:RdTest) {
         T.start("basics")
-        def d:RdOtDelta (RdOtDelta.diff("Hello world" "Hello brave world" -1))
+        def d:RdOtDelta (RdOtDelta.diff((ot_of "Hello world") (ot_of "Hello brave world") -1))
         T.eqStr((d.toJson()) "[{\"retain\":6},{\"insert\":\"brave \"}]" "insert")
-        T.eqStr((d.apply("Hello world")) "Hello brave world" "apply insert")
-        def d2:RdOtDelta (RdOtDelta.diff("Hello brave world" "Hello world" -1))
+        T.eqStr((ot_str (d.apply((ot_of "Hello world")))) "Hello brave world" "apply insert")
+        def d2:RdOtDelta (RdOtDelta.diff((ot_of "Hello brave world") (ot_of "Hello world") -1))
         T.eqStr((d2.toJson()) "[{\"retain\":6},{\"delete\":6}]" "delete")
-        def d3:RdOtDelta (RdOtDelta.diff("abc" "aXc" -1))
+        def d3:RdOtDelta (RdOtDelta.diff((ot_of "abc") (ot_of "aXc") -1))
         T.eqStr((d3.toJson()) "[{\"retain\":1},{\"insert\":\"X\"},{\"delete\":1}]" "replace: insert before delete")
         def d4:RdOtDelta (new RdOtDelta())
         d4.retain(1)
         d4.delete(1)
-        d4.insert("X")
+        d4.insert((ot_of "X"))
         T.ok((d4.equals(d3)) "delete then insert is the same delta")
         ; which a is new: the caret says
-        def e1:RdOtDelta (RdOtDelta.diff("aa" "aaa" 1))
+        def e1:RdOtDelta (RdOtDelta.diff((ot_of "aa") (ot_of "aaa") 1))
         T.eqStr((e1.toJson()) "[{\"insert\":\"a\"}]" "caret 1: typed at the start")
-        def e2:RdOtDelta (RdOtDelta.diff("aa" "aaa" 3))
+        def e2:RdOtDelta (RdOtDelta.diff((ot_of "aa") (ot_of "aaa") 3))
         T.eqStr((e2.toJson()) "[{\"retain\":2},{\"insert\":\"a\"}]" "caret 3: typed at the end")
-        def e3:RdOtDelta (RdOtDelta.diff("aaa" "aa" 0))
+        def e3:RdOtDelta (RdOtDelta.diff((ot_of "aaa") (ot_of "aa") 0))
         T.eqStr((e3.toJson()) "[{\"delete\":1}]" "backspace at 1")
         ; 😀 -> 😁 share their first unit: the insert is the whole emoji
-        def s1:RdOtDelta (RdOtDelta.diff("x😀y" "x😁y" -1))
+        def s1:RdOtDelta (RdOtDelta.diff((ot_of "x😀y") (ot_of "x😁y") -1))
         T.eqStr((s1.toJson()) "[{\"retain\":1},{\"insert\":\"😁\"},{\"delete\":2}]" "surrogate pair kept whole")
-        def s2:RdOtDelta (RdOtDelta.diff("😀😀" "😀" -1))
+        def s2:RdOtDelta (RdOtDelta.diff((ot_of "😀😀") (ot_of "😀") -1))
         T.eqInt((array_length s2.ops) 2 "emoji removed: retain + delete")
         def o:RdOtOp (itemAt s2.ops 0)
         T.eqInt(o.n 2 "retain is a whole emoji")
@@ -118,20 +118,20 @@ class OtTests {
         T.ok((p2.ok == false) "unclosed array refused")
         def bad:RdOtDelta (new RdOtDelta())
         bad.retain(10)
-        def r:RdOtApplied (bad.tryApply("short"))
+        def r:RdOtApplied (bad.tryApply((ot_of "short")))
         T.ok((r.ok == false) "a delta for a longer text is refused")
         ; transform: both insert at one place, the first argument goes first
-        def a:RdOtDelta (RdOtDelta.diff("ab" "aXb" -1))
-        def b:RdOtDelta (RdOtDelta.diff("ab" "aYb" -1))
+        def a:RdOtDelta (RdOtDelta.diff((ot_of "ab") (ot_of "aXb") -1))
+        def b:RdOtDelta (RdOtDelta.diff((ot_of "ab") (ot_of "aYb") -1))
         def pr:RdOtPair (RdOtDelta.transform(a b))
-        T.eqStr((pr.b.apply((a.apply("ab")))) "aXYb" "a first (after a)")
-        T.eqStr((pr.a.apply((b.apply("ab")))) "aXYb" "a first (after b)")
+        T.eqStr((ot_str (pr.b.apply((a.apply((ot_of "ab")))))) "aXYb" "a first (after a)")
+        T.eqStr((ot_str (pr.a.apply((b.apply((ot_of "ab")))))) "aXYb" "a first (after b)")
         ; a caret after an insert at it
-        def ins:RdOtDelta (RdOtDelta.diff("abc" "aZZbc" -1))
+        def ins:RdOtDelta (RdOtDelta.diff((ot_of "abc") (ot_of "aZZbc") -1))
         T.eqInt((ins.transformIndex(1 false)) 1 "insert at the caret: the caret stays before")
         T.eqInt((ins.transformIndex(1 true)) 3 "own insert: the caret after it")
         T.eqInt((ins.transformIndex(2 false)) 4 "after the insert: moved")
-        def del:RdOtDelta (RdOtDelta.diff("abcdef" "af" -1))
+        def del:RdOtDelta (RdOtDelta.diff((ot_of "abcdef") (ot_of "af") -1))
         T.eqInt((del.transformIndex(3 false)) 1 "inside a delete: its start")
         T.eqInt((del.transformIndex(6 false)) 2 "after a delete: back")
     }
@@ -141,31 +141,31 @@ class OtTests {
         def R (new RdRandom(4242))
         def round:int 0
         while (round < 2000) {
-            def s:string (OtTests.randomString(R (R.below(30))))
+            def s:RdOtStr (OtTests.randomString(R (R.below(30))))
             def a:RdOtDelta (OtTests.randomDelta(R s))
             def b:RdOtDelta (OtTests.randomDelta(R s))
-            def sa:string (a.apply(s))
-            def sb:string (b.apply(s))
+            def sa:RdOtStr (a.apply(s))
+            def sb:RdOtStr (b.apply(s))
             def p:RdOtPair (RdOtDelta.transform(a b))
-            def ab:string (p.b.apply(sa))
-            def ba:string (p.a.apply(sb))
-            T.eqStr(ab ba "TP1: both orders give one text")
+            def ab:RdOtStr (p.b.apply(sa))
+            def ba:RdOtStr (p.a.apply(sb))
+            T.eqStr((ot_str ab) (ot_str ba) "TP1: both orders give one text")
             ; compose = one after the other
             def c:RdOtDelta (OtTests.randomDelta(R sa))
             def ac:RdOtDelta (a.compose(c))
-            T.eqStr((ac.apply(s)) (c.apply(sa)) "compose")
+            T.eqStr((ot_str (ac.apply(s))) (ot_str (c.apply(sa))) "compose")
             ; invert undoes
             def inv:RdOtDelta (a.invert(s))
-            T.eqStr((inv.apply(sa)) s "invert")
+            T.eqStr((ot_str (inv.apply(sa))) (ot_str s) "invert")
             ; diff of the two texts gives the second
-            def dd:RdOtDelta (RdOtDelta.diff(s sa (R.below(((strlen sa) + 1)))))
-            T.eqStr((dd.apply(s)) sa "diff")
+            def dd:RdOtDelta (RdOtDelta.diff(s sa (R.below(((ot_len sa) + 1)))))
+            T.eqStr((ot_str (dd.apply(s))) (ot_str sa) "diff")
             ; JSON round trip
             def j:RdOtDelta (RdOtDelta.fromJson((a.toJson())))
-            T.eqStr((j.apply(s)) sa "JSON")
+            T.eqStr((ot_str (j.apply(s))) (ot_str sa) "JSON")
             ; a character before every edit keeps its place
-            if ((strlen s) > 0) {
-                def at:int (R.below((strlen s)))
+            if ((ot_len s) > 0) {
+                def at:int (R.below((ot_len s)))
                 def moved:int (a.transformIndex(at true))
                 def survives:boolean true
                 def pos:int 0
@@ -180,7 +180,7 @@ class OtTests {
                     }
                 }
                 if survives {
-                    T.eqInt((charAt sa moved) (charAt s at) "index transform keeps the character")
+                    T.eqInt((ot_at sa moved) (ot_at s at) "index transform keeps the character")
                 }
             }
             round = (round + 1)
@@ -192,7 +192,7 @@ class OtTests {
     sfn simulate:void (T:RdTest seed:int clients:int steps:int) {
         T.start(("simulation " + (to_string clients)) + " clients")
         def R (new RdRandom(seed))
-        def start:string "# Title\n\nSome text 😀 here.\n"
+        def start:RdOtStr (ot_of "# Title\n\nSome text 😀 here.\n")
         def hub (new RdOtHub(start))
         def sims:[OtSim]
         def i:int 0
@@ -270,7 +270,7 @@ class OtTests {
             }
         }
         for sims c:OtSim k {
-            T.eqStr(c.text hub.text ("client " + c.id) + " has the hub's text")
+            T.eqStr((ot_str c.text) (ot_str hub.text) ("client " + c.id) + " has the hub's text")
             T.eqInt(c.client.rev hub.rev ("client " + c.id) + " has every revision")
         }
         T.ok((hub.rev > 0) "edits went through")

@@ -7,6 +7,7 @@
   "main": "dist/rangerdiff.mjs",
   "scripts": {
     "test": "node scripts/test.mjs",
+    "test:go": "node scripts/test-go.mjs",
     "build": "node scripts/build.mjs",
     "bench": "node scripts/bench.mjs",
     "testdata": "python3 testdata/gen/make_files.py",
