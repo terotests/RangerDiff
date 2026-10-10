@@ -5532,14 +5532,14 @@ export class RdOtDelta  {
     if ( c > 0 ) {
       const last = this.ops[(c - 1)];
       if ( last.kind == 2 ) {
-        last.text = last.text + s;
+        last.text = (last.text + s);
         return this;
       }
       if ( last.kind == 3 ) {
         if ( c > 1 ) {
           const prev = this.ops[(c - 2)];
           if ( prev.kind == 2 ) {
-            prev.text = prev.text + s;
+            prev.text = (prev.text + s);
             return this;
           }
         }
@@ -5615,7 +5615,7 @@ export class RdOtDelta  {
     while (i < a.ops.length) {
       const x = a.ops[i];
       const y = b.ops[i];
-      if ( (x.kind != y.kind || x.n != y.n) || x.text != y.text ) {
+      if ( (x.kind != y.kind || x.n != y.n) || (x.text === y.text) == false ) {
         return false;
       }
       i = i + 1;
@@ -5645,12 +5645,12 @@ export class RdOtDelta  {
       r.error = "the delta is for a longer text";
       return r;
     }
-    let parts = [];
+    const parts = [];
     let pos = 0;
     // Loop start
     for ( const o of this.ops) {
       if ( o.kind == 1 ) {
-        parts.push(s.substring(pos, pos + o.n ));
+        parts.push(s.substring(pos, pos + o.n));
         pos = pos + o.n;
       }
       if ( o.kind == 2 ) {
@@ -5660,7 +5660,7 @@ export class RdOtDelta  {
         pos = pos + o.n;
       }
     }
-    parts.push(s.substring(pos, n ));
+    parts.push(s.substring(pos, n));
     r.text = parts.join("");
     return r;
   };
@@ -5677,7 +5677,7 @@ export class RdOtDelta  {
         d.delete(o.text.length);
       }
       if ( o.kind == 3 ) {
-        d.insert(base.substring(pos, pos + o.n ));
+        d.insert(base.substring(pos, pos + o.n));
         pos = pos + o.n;
       }
     }
@@ -5835,7 +5835,7 @@ RdOtDelta.diff = function(a, b, caret) {
     most = lb;
   }
   let p = 0;
-  while (p < most && a.charCodeAt(p ) == b.charCodeAt(p )) {
+  while (p < most && a.charCodeAt(p) == b.charCodeAt(p)) {
     p = p + 1;
   };
   if ( caret >= 0 ) {
@@ -5851,22 +5851,22 @@ RdOtDelta.diff = function(a, b, caret) {
       p = lim;
     }
   }
-  if ( (p > 0 && p < la) && RdOtDelta.isLow(a.charCodeAt(p )) ) {
+  if ( (p > 0 && p < la) && RdOtDelta.isLow(a.charCodeAt(p)) ) {
     p = p - 1;
   }
-  if ( (p > 0 && p < lb) && RdOtDelta.isLow(b.charCodeAt(p )) ) {
+  if ( (p > 0 && p < lb) && RdOtDelta.isLow(b.charCodeAt(p)) ) {
     p = p - 1;
   }
   let s = 0;
-  while ((s < la - p && s < lb - p) && a.charCodeAt((la - 1) - s ) == b.charCodeAt((lb - 1) - s )) {
+  while ((s < la - p && s < lb - p) && a.charCodeAt((la - 1) - s) == b.charCodeAt((lb - 1) - s)) {
     s = s + 1;
   };
-  while (s > 0 && RdOtDelta.isLow(a.charCodeAt(la - s ))) {
+  while (s > 0 && RdOtDelta.isLow(a.charCodeAt(la - s))) {
     s = s - 1;
   };
   const d = new RdOtDelta();
   d.retain(p);
-  d.insert(b.substring(p, lb - s ));
+  d.insert(b.substring(p, lb - s));
   d.delete((la - p) - s);
   d.retain(s);
   return d;
@@ -5897,7 +5897,7 @@ RdOtDelta.quote = function(s) {
   let start = 0;
   let i = 0;
   while (i < n) {
-    const c = s.charCodeAt(i );
+    const c = s.charCodeAt(i);
     let esc = "";
     if ( c == 34 ) {
       esc = "\\\"";
@@ -5918,13 +5918,13 @@ RdOtDelta.quote = function(s) {
       esc = "\\u" + RdOtDelta.hex4(c);
     }
     if ( esc.length > 0 ) {
-      parts.push(s.substring(start, i ));
+      parts.push(s.substring(start, i));
       parts.push(esc);
       start = i + 1;
     }
     i = i + 1;
   };
-  parts.push(s.substring(start, n ));
+  parts.push(s.substring(start, n));
   return ("\"" + parts.join("")) + "\"";
 };
 RdOtDelta.fromJson = function(s) {
@@ -5969,9 +5969,9 @@ export class RdOtReader  {
     if ( k > __len - this.off ) {
       k = __len - this.off;
     }
-    const piece = RdOtOp.make(o.kind, k, "");
+    const piece = RdOtOp.make(o.kind, k, (""));
     if ( o.kind == 2 ) {
-      piece.text = o.text.substring(this.off, this.off + k );
+      piece.text = o.text.substring(this.off, this.off + k);
       piece.n = 0;
     }
     this.off = this.off + k;
@@ -6033,7 +6033,7 @@ export class RdOtJson  {
       this.ok = false;
       return "";
     }
-    let parts = [];
+    const parts = [];
     const n = this.s.length;
     let start = this.pos;
     while (this.pos < n) {
@@ -6052,13 +6052,13 @@ export class RdOtJson  {
         const e = this.s.charCodeAt(this.pos + 1 );
         this.pos = this.pos + 2;
         if ( e == 110 ) {
-          parts.push("\n");
+          parts.push(String.fromCharCode(10));
         }
         if ( e == 114 ) {
-          parts.push("\r");
+          parts.push(String.fromCharCode(13));
         }
         if ( e == 116 ) {
-          parts.push("\t");
+          parts.push(String.fromCharCode(9));
         }
         if ( e == 98 ) {
           parts.push(String.fromCharCode(8));
@@ -6067,7 +6067,7 @@ export class RdOtJson  {
           parts.push(String.fromCharCode(12));
         }
         if ( (e == 34 || e == 92) || e == 47 ) {
-          parts.push(this.s.substring(this.pos - 1, this.pos ));
+          parts.push(String.fromCharCode(e));
         }
         if ( e == 117 ) {
           if ( this.pos + 4 > n ) {

@@ -23,21 +23,118 @@
 ; Two inserts at the same place: `a`'s goes first (the server's order: what
 ; it took earlier is `a` for whoever transforms over it).
 ;
-; `RdOtHub` is the server's part (check the revision, apply, keep the log),
-; the same rules the folder server runs in Go; the tests drive many clients
-; through it with random delays.
+; `RdOtHub` is the server's part (check the revision, apply, keep the log).
+; The tests drive many clients through it with random delays.
+;
+; TEXT IS `RdOtStr`, counted in UTF-16 code units on every target. Ranger's
+; own `strlen`/`charAt`/`substring` count the target's unit (a UTF-16 unit
+; in JavaScript, a byte in Go), and the counts in a delta are the protocol:
+; a page and a Go server have to mean the same text by "retain 5". So the
+; text is a JavaScript string in JavaScript and a []uint16 in Go, and the
+; `ot_*` operators below are the only places that touch it. Sliqtly's
+; folder server compiles this file to Go (mcp-go/rdiff).
 ; ============================================================================
+
+systemclass RdOtStr {
+    es6 string
+    go "[]uint16"
+}
+
+systemclass RdOtBuf {
+    es6 Array
+    go "*r_ot_buf"
+}
+
+operators {
+    ; text from a string, and back
+    ot_of _:RdOtStr (s:string) {
+        templates {
+            es6 ( (e 1) )
+            go ( "utf16.Encode([]rune(" (e 1) "))" (imp "unicode/utf16") )
+        }
+    }
+    ot_str _:string (s:RdOtStr) {
+        templates {
+            es6 ( (e 1) )
+            go ( "string(utf16.Decode(" (e 1) "))" (imp "unicode/utf16") )
+        }
+    }
+    ; one code unit (a surrogate half stays one)
+    ot_unit _:RdOtStr (c:int) {
+        templates {
+            es6 ( "String.fromCharCode(" (e 1) ")" )
+            go ( "[]uint16{uint16(" (e 1) ")}" )
+        }
+    }
+    ot_len _:int (s:RdOtStr) {
+        templates {
+            es6 ( (e 1) ".length" )
+            go ( "int64(len(" (e 1) "))" )
+        }
+    }
+    ot_at _:int (s:RdOtStr i:int) {
+        templates {
+            es6 ( (e 1) ".charCodeAt(" (e 2) ")" )
+            go ( "int64(" (e 1) "[" (e 2) "])" )
+        }
+    }
+    ot_slice _:RdOtStr (s:RdOtStr from:int to:int) {
+        templates {
+            es6 ( (e 1) ".substring(" (e 2) ", " (e 3) ")" )
+            go ( (e 1) "[" (e 2) ":" (e 3) "]" )
+        }
+    }
+    ; a new text: never appends into a slice another text shares
+    ot_cat _:RdOtStr (a:RdOtStr b:RdOtStr) {
+        templates {
+            es6 ( "(" (e 1) " + " (e 2) ")" )
+            go ( "append(append(make([]uint16, 0, len(" (e 1) ")+len(" (e 2) ")), " (e 1) "...), " (e 2) "...)" )
+        }
+    }
+    ; a text built from pieces (an array of texts is an array of pointers in
+    ; Go, so the pieces go into one buffer instead)
+    ot_buf _:RdOtBuf () {
+        templates {
+            es6 ( "[]" )
+            go ( "&r_ot_buf{}"
+(create_polyfill "
+type r_ot_buf struct {
+    u []uint16
+}
+")
+            )
+        }
+    }
+    ot_add _:void (b:RdOtBuf s:RdOtStr) {
+        templates {
+            es6 ( (e 1) ".push(" (e 2) ")" )
+            go ( (e 1) ".u = append(" (e 1) ".u, " (e 2) "...)" )
+        }
+    }
+    ot_done _:RdOtStr (b:RdOtBuf) {
+        templates {
+            es6 ( (e 1) ".join(\"\")" )
+            go ( (e 1) ".u" )
+        }
+    }
+    ot_eq _:boolean (a:RdOtStr b:RdOtStr) {
+        templates {
+            es6 ( "(" (e 1) " === " (e 2) ")" )
+            go ( "slices.Equal(" (e 1) ", " (e 2) ")" (imp "slices") )
+        }
+    }
+}
 
 class RdOtOp {
     ; 1 retain, 2 insert, 3 delete
     def kind:int 0
     def n:int 0
-    def text:string ""
+    def text:RdOtStr (ot_of "")
 
     Constructor () {
     }
 
-    sfn make:RdOtOp (kind:int n:int text:string) {
+    sfn make:RdOtOp (kind:int n:int text:RdOtStr) {
         def o:RdOtOp (new RdOtOp())
         o.kind = kind
         o.n = n
@@ -47,7 +144,7 @@ class RdOtOp {
 
     fn len:int () {
         if (kind == 2) {
-            return (strlen text)
+            return (ot_len text)
         }
         return n
     }
@@ -86,30 +183,30 @@ class RdOtDelta {
                 return this
             }
         }
-        push ops (RdOtOp.make(1 n ""))
+        push ops (RdOtOp.make(1 n (ot_of "")))
         return this
     }
 
     ; an insert goes before a delete it follows: insert+delete and
     ; delete+insert are the same edit, and one canonical form makes equal
     ; edits equal deltas
-    fn insert:RdOtDelta (s:string) {
-        if ((strlen s) == 0) {
+    fn insert:RdOtDelta (s:RdOtStr) {
+        if ((ot_len s) == 0) {
             return this
         }
-        targetLength = (targetLength + (strlen s))
+        targetLength = (targetLength + (ot_len s))
         def c:int (array_length ops)
         if (c > 0) {
             def last:RdOtOp (itemAt ops (c - 1))
             if (last.kind == 2) {
-                last.text = (last.text + s)
+                last.text = (ot_cat last.text s)
                 return this
             }
             if (last.kind == 3) {
                 if (c > 1) {
                     def prev:RdOtOp (itemAt ops (c - 2))
                     if (prev.kind == 2) {
-                        prev.text = (prev.text + s)
+                        prev.text = (ot_cat prev.text s)
                         return this
                     }
                 }
@@ -138,7 +235,7 @@ class RdOtDelta {
                 return this
             }
         }
-        push ops (RdOtOp.make(3 n ""))
+        push ops (RdOtOp.make(3 n (ot_of "")))
         return this
     }
 
@@ -192,7 +289,7 @@ class RdOtDelta {
         while (i < (array_length a.ops)) {
             def x:RdOtOp (itemAt a.ops i)
             def y:RdOtOp (itemAt b.ops i)
-            if (((x.kind != y.kind) || (x.n != y.n)) || (x.text != y.text)) {
+            if (((x.kind != y.kind) || (x.n != y.n)) || ((ot_eq x.text y.text) == false)) {
                 return false
             }
             i = (i + 1)
@@ -217,41 +314,41 @@ class RdOtDelta {
 
     ; the new text, or "" with `ok` false on the result when the delta does
     ; not fit (`tryApply`)
-    fn apply:string (s:string) {
+    fn apply:RdOtStr (s:RdOtStr) {
         def r:RdOtApplied (this.tryApply(s))
         return r.text
     }
 
-    fn tryApply:RdOtApplied (s:string) {
+    fn tryApply:RdOtApplied (s:RdOtStr) {
         def r:RdOtApplied (new RdOtApplied())
-        def n:int (strlen s)
+        def n:int (ot_len s)
         if (baseLength > n) {
             r.ok = false
             r.error = "the delta is for a longer text"
             return r
         }
-        def parts:[string]
+        def parts:RdOtBuf (ot_buf)
         def pos:int 0
         for ops o:RdOtOp i {
             if (o.kind == 1) {
-                push parts (substring s pos (pos + o.n))
+                ot_add parts (ot_slice s pos (pos + o.n))
                 pos = (pos + o.n)
             }
             if (o.kind == 2) {
-                push parts o.text
+                ot_add parts o.text
             }
             if (o.kind == 3) {
                 pos = (pos + o.n)
             }
         }
-        push parts (substring s pos n)
-        r.text = (join parts "")
+        ot_add parts (ot_slice s pos n)
+        r.text = (ot_done parts)
         return r
     }
 
     ; the delta that undoes this one on the text it made (`base` is the text
     ; this one was applied to)
-    fn invert:RdOtDelta (base:string) {
+    fn invert:RdOtDelta (base:RdOtStr) {
         def d:RdOtDelta (new RdOtDelta())
         def pos:int 0
         for ops o:RdOtOp i {
@@ -260,10 +357,10 @@ class RdOtDelta {
                 pos = (pos + o.n)
             }
             if (o.kind == 2) {
-                d.delete((strlen o.text))
+                d.delete((ot_len o.text))
             }
             if (o.kind == 3) {
-                d.insert((substring base pos (pos + o.n)))
+                d.insert((ot_slice base pos (pos + o.n)))
                 pos = (pos + o.n)
             }
         }
@@ -342,15 +439,15 @@ class RdOtDelta {
         while ((ra.more()) || (rb.more())) {
             if ((ra.kind()) == 2) {
                 def ia:RdOtOp (ra.take(ra.left()))
-                def s:string ia.text
+                def s:RdOtStr ia.text
                 p.a.insert(s)
-                p.b.retain((strlen s))
+                p.b.retain((ot_len s))
                 continue
             }
             if ((rb.kind()) == 2) {
                 def ib2:RdOtOp (rb.take(rb.left()))
-                def s2:string ib2.text
-                p.a.retain((strlen s2))
+                def s2:RdOtStr ib2.text
+                p.a.retain((ot_len s2))
                 p.b.insert(s2)
                 continue
             }
@@ -393,7 +490,7 @@ class RdOtDelta {
             }
             if (o.kind == 2) {
                 if ((pos < at) || ((pos == at) && after)) {
-                    out = (out + (strlen o.text))
+                    out = (out + (ot_len o.text))
                 }
             }
             if (o.kind == 3) {
@@ -416,15 +513,15 @@ class RdOtDelta {
     ; where the caret is in `b` after the edit; it settles a repeat ("aa" ->
     ; "aaa": which a is new) the way the person typed it. Never splits a
     ; surrogate pair, so each insert is whole characters.
-    sfn diff:RdOtDelta (a:string b:string caret:int) {
-        def la:int (strlen a)
-        def lb:int (strlen b)
+    sfn diff:RdOtDelta (a:RdOtStr b:RdOtStr caret:int) {
+        def la:int (ot_len a)
+        def lb:int (ot_len b)
         def most:int la
         if (lb < most) {
             most = lb
         }
         def p:int 0
-        while ((p < most) && ((charAt a p) == (charAt b p))) {
+        while ((p < most) && ((ot_at a p) == (ot_at b p))) {
             p = (p + 1)
         }
         if (caret >= 0) {
@@ -440,23 +537,23 @@ class RdOtDelta {
                 p = lim
             }
         }
-        if ((p > 0) && (p < la) && (RdOtDelta.isLow((charAt a p)))) {
+        if ((p > 0) && (p < la) && (RdOtDelta.isLow((ot_at a p)))) {
             p = (p - 1)
         }
-        if ((p > 0) && (p < lb) && (RdOtDelta.isLow((charAt b p)))) {
+        if ((p > 0) && (p < lb) && (RdOtDelta.isLow((ot_at b p)))) {
             p = (p - 1)
         }
         def s:int 0
-        while (((s < (la - p)) && (s < (lb - p))) && ((charAt a ((la - 1) - s)) == (charAt b ((lb - 1) - s)))) {
+        while (((s < (la - p)) && (s < (lb - p))) && ((ot_at a ((la - 1) - s)) == (ot_at b ((lb - 1) - s)))) {
             s = (s + 1)
         }
         ; the kept end starts after a whole character
-        while ((s > 0) && (RdOtDelta.isLow((charAt a (la - s))))) {
+        while ((s > 0) && (RdOtDelta.isLow((ot_at a (la - s))))) {
             s = (s - 1)
         }
         def d:RdOtDelta (new RdOtDelta())
         d.retain(p)
-        d.insert((substring b p (lb - s)))
+        d.insert((ot_slice b p (lb - s)))
         d.delete(((la - p) - s))
         d.retain(s)
         return d
@@ -509,13 +606,13 @@ class RdOtDelta {
         return out
     }
 
-    sfn quote:string (s:string) {
+    sfn quote:string (s:RdOtStr) {
         def parts:[string]
-        def n:int (strlen s)
+        def n:int (ot_len s)
         def start:int 0
         def i:int 0
         while (i < n) {
-            def c:int (charAt s i)
+            def c:int (ot_at s i)
             def esc:string ""
             if (c == 34) {
                 esc = "\\\""
@@ -536,13 +633,13 @@ class RdOtDelta {
                 esc = ("\\u" + (RdOtDelta.hex4(c)))
             }
             if ((strlen esc) > 0) {
-                push parts (substring s start i)
+                push parts (ot_str (ot_slice s start i))
                 push parts esc
                 start = (i + 1)
             }
             i = (i + 1)
         }
-        push parts (substring s start n)
+        push parts (ot_str (ot_slice s start n))
         return (("\"" + (join parts "")) + "\"")
     }
 
@@ -557,7 +654,7 @@ class RdOtDelta {
 class RdOtApplied {
     def ok:boolean true
     def error:string ""
-    def text:string ""
+    def text:RdOtStr (ot_of "")
 
     Constructor () {
     }
@@ -601,9 +698,9 @@ class RdOtReader {
         if (k > (len - off)) {
             k = (len - off)
         }
-        def piece:RdOtOp (RdOtOp.make(o.kind k ""))
+        def piece:RdOtOp (RdOtOp.make(o.kind k (ot_of "")))
         if (o.kind == 2) {
-            piece.text = (substring o.text off (off + k))
+            piece.text = (ot_slice o.text off (off + k))
             piece.n = 0
         }
         off = (off + k)
@@ -681,51 +778,51 @@ class RdOtJson {
         return -1
     }
 
-    fn str:string () {
+    fn str:RdOtStr () {
         if ((this.eat(34)) == false) {
             ok = false
-            return ""
+            return (ot_of "")
         }
-        def parts:[string]
+        def parts:RdOtBuf (ot_buf)
         def n:int (strlen s)
         def start:int pos
         while (pos < n) {
             def c:int (charAt s pos)
             if (c == 34) {
-                push parts (substring s start pos)
+                ot_add parts (ot_of (substring s start pos))
                 pos = (pos + 1)
-                return (join parts "")
+                return (ot_done parts)
             }
             if (c == 92) {
-                push parts (substring s start pos)
+                ot_add parts (ot_of (substring s start pos))
                 if ((pos + 1) >= n) {
                     ok = false
-                    return ""
+                    return (ot_of "")
                 }
                 def e:int (charAt s (pos + 1))
                 pos = (pos + 2)
                 if (e == 110) {
-                    push parts "\n"
+                    ot_add parts (ot_unit 10)
                 }
                 if (e == 114) {
-                    push parts "\r"
+                    ot_add parts (ot_unit 13)
                 }
                 if (e == 116) {
-                    push parts "\t"
+                    ot_add parts (ot_unit 9)
                 }
                 if (e == 98) {
-                    push parts (strfromcode 8)
+                    ot_add parts (ot_unit 8)
                 }
                 if (e == 102) {
-                    push parts (strfromcode 12)
+                    ot_add parts (ot_unit 12)
                 }
                 if (((e == 34) || (e == 92)) || (e == 47)) {
-                    push parts (substring s (pos - 1) pos)
+                    ot_add parts (ot_unit e)
                 }
                 if (e == 117) {
                     if ((pos + 4) > n) {
                         ok = false
-                        return ""
+                        return (ot_of "")
                     }
                     def v:int 0
                     def k:int 0
@@ -733,13 +830,13 @@ class RdOtJson {
                         def h:int (RdOtJson.hexVal((charAt s (pos + k))))
                         if (h < 0) {
                             ok = false
-                            return ""
+                            return (ot_of "")
                         }
                         v = ((v * 16) + h)
                         k = (k + 1)
                     }
                     pos = (pos + 4)
-                    push parts (strfromcode v)
+                    ot_add parts (ot_unit v)
                 }
                 start = pos
                 continue
@@ -747,7 +844,7 @@ class RdOtJson {
             pos = (pos + 1)
         }
         ok = false
-        return ""
+        return (ot_of "")
     }
 
     fn delta:RdOtDelta () {
@@ -764,7 +861,7 @@ class RdOtJson {
                 ok = false
                 return d
             }
-            def key:string (this.str())
+            def key:string (ot_str (this.str()))
             if ((this.eat(58)) == false) {
                 ok = false
                 return d
@@ -932,11 +1029,11 @@ class RdOtLogged {
 }
 
 class RdOtHub {
-    def text:string ""
+    def text:RdOtStr (ot_of "")
     def rev:int 0
     def log:[RdOtLogged]
 
-    Constructor (start:string) {
+    Constructor (start:RdOtStr) {
         text = start
     }
 
@@ -954,9 +1051,9 @@ class RdOtHub {
             full = pr.a
             i = (i + 1)
         }
-        full.padTo((strlen text))
+        full.padTo((ot_len text))
         def r:RdOtApplied (full.tryApply(text))
-        if ((r.ok == false) || (full.baseLength != (strlen text))) {
+        if ((r.ok == false) || (full.baseLength != (ot_len text))) {
             return false
         }
         text = r.text
