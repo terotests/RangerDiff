@@ -1,0 +1,801 @@
+; SPDX-License-Identifier: MIT
+
+; ============================================================================
+; RdPatch.rgr — unified diffs: parse, apply, reverse, partial texts, line maps
+; ============================================================================
+; A patch is one file's unified diff: `git diff` output (`diff --git`,
+; `index`, `---` / `+++` headers) or a bare GitHub pull request `patch`
+; (hunks only). RdText.unified writes the same form.
+;
+; Line numbers are 1-based, as in the hunk headers. A side with length 0
+; names the line AFTER which the change goes (`@@ -0,0 +1,3 @@` inserts at
+; the top).
+;
+; Text is split on "\n" like RdText, so a text that ends with a newline has
+; an empty last line. A patch from git leaves that empty line out of its
+; hunks and marks a missing final newline with `\ No newline at end of file`;
+; apply / reverse add or drop the empty last line where one side has the
+; marker and the other does not. Patches from RdText.unified count the empty
+; line as a line and round-trip as they are.
+;
+; Apply and reverse are strict: every context and removed line must match
+; at the place the header names (no fuzz, no offset search). The first
+; mismatch is reported with its line, the expected and the found text.
+; ============================================================================
+
+class RdPatchLine {
+    ; "same", "add" or "del"
+    def kind:string "same"
+    def text:string ""
+    ; 1-based; 0 on the side the line is not on (oldLine of an add)
+    def oldLine:int 0
+    def newLine:int 0
+
+    Constructor () {
+    }
+}
+
+class RdPatchHunk {
+    def oldStart:int 0
+    def oldLen:int 0
+    def newStart:int 0
+    def newLen:int 0
+    ; the text after the closing `@@` (often the enclosing function)
+    def section:string ""
+    def lines:[RdPatchLine]
+    ; `\ No newline at end of file` after the last old / new line
+    def oldNoNewline:boolean false
+    def newNoNewline:boolean false
+
+    Constructor () {
+    }
+
+    ; first line number on a side, also for a side with no lines
+    fn oldFirst:int () {
+        if (oldLen == 0) {
+            return (oldStart + 1)
+        }
+        return oldStart
+    }
+
+    fn newFirst:int () {
+        if (newLen == 0) {
+            return (newStart + 1)
+        }
+        return newStart
+    }
+}
+
+class RdPatchFile {
+    ; paths without the a/ b/ prefix; "/dev/null" for an added / deleted file
+    def oldPath:string ""
+    def newPath:string ""
+    def hunks:[RdPatchHunk]
+    def errors:[string]
+    def added:int 0
+    def removed:int 0
+
+    Constructor () {
+    }
+
+    fn ok:boolean () {
+        return ((array_length errors) == 0)
+    }
+
+    ; the first error, "" when there is none
+    fn error:string () {
+        if ((array_length errors) == 0) {
+            return ""
+        }
+        return (itemAt errors 0)
+    }
+}
+
+class RdPatchResult {
+    def ok:boolean true
+    def text:string ""
+    ; the first mismatch: line number in the input text (1-based), the line
+    ; the patch expected, the line found ("" past the end), the hunk (0-based)
+    def line:int 0
+    def expected:string ""
+    def got:string ""
+    def hunk:int -1
+    def message:string ""
+
+    Constructor () {
+    }
+}
+
+; part of a text: lines from line `start` (1-based) on
+class RdPatchRange {
+    def start:int 1
+    def lines:[string]
+    ; false when a hunk only partly inside this range was left out
+    def complete:boolean true
+
+    Constructor () {
+    }
+
+    fn end:int () {
+        return (start + (array_length lines))
+    }
+}
+
+class RdPatchPartial {
+    def ok:boolean true
+    ; the given ranges on the other side, in the same order
+    def ranges:[RdPatchRange]
+    ; hunks applied inside a range (0-based hunk indexes)
+    def applied:[int]
+    ; hunks not inside any range: wholly outside, or crossing a range edge
+    def outside:[int]
+    ; of those, the ones that overlap a range (that range is incomplete)
+    def crossing:[int]
+    ; the first mismatch, as in RdPatchResult
+    def line:int 0
+    def expected:string ""
+    def got:string ""
+    def hunk:int -1
+    def message:string ""
+
+    Constructor () {
+    }
+}
+
+class RdPatch {
+
+    ; ------------------------------------------------------------- parse
+
+    static sfn startsWith:boolean (s:string p:string) {
+        def n:int (strlen p)
+        if ((strlen s) < n) {
+            return false
+        }
+        return ((substring s 0 n) == p)
+    }
+
+    static sfn dropCR:string (s:string) {
+        def n:int (strlen s)
+        if ((n > 0) && ((charAt s (n - 1)) == 13)) {
+            return (substring s 0 (n - 1))
+        }
+        return s
+    }
+
+    ; a header path: no timestamp after a tab, no a/ or b/ prefix
+    static sfn headerPath:string (s:string) {
+        def p:string s
+        def tab:int (indexOf p "\t")
+        if (tab >= 0) {
+            p = (substring p 0 tab)
+        }
+        if ((RdPatch.startsWith(p "a/")) || (RdPatch.startsWith(p "b/"))) {
+            p = (substring p 2 (strlen p))
+        }
+        return p
+    }
+
+    ; digits at pos; -1 when there are none
+    static sfn numberAt:int (s:string pos:int) {
+        def n:int (strlen s)
+        def v:int 0
+        def i:int pos
+        while (i < n) {
+            def c:int (charAt s i)
+            if ((c < 48) || (c > 57)) {
+                break
+            }
+            v = ((v * 10) + (c - 48))
+            i = (i + 1)
+        }
+        if (i == pos) {
+            return -1
+        }
+        return v
+    }
+
+    static sfn digitsEnd:int (s:string pos:int) {
+        def n:int (strlen s)
+        def i:int pos
+        while (i < n) {
+            def c:int (charAt s i)
+            if ((c < 48) || (c > 57)) {
+                break
+            }
+            i = (i + 1)
+        }
+        return i
+    }
+
+    ; `@@ -a[,b] +c[,d] @@ section`; false when the header is malformed
+    static sfn parseHeader:boolean (s:string h:RdPatchHunk) {
+        if ((RdPatch.startsWith(s "@@ -")) == false) {
+            return false
+        }
+        def pos:int 4
+        def v:int (RdPatch.numberAt(s pos))
+        if (v < 0) {
+            return false
+        }
+        h.oldStart = v
+        h.oldLen = 1
+        pos = (RdPatch.digitsEnd(s pos))
+        if ((pos < (strlen s)) && ((charAt s pos) == 44)) {
+            v = (RdPatch.numberAt(s (pos + 1)))
+            if (v < 0) {
+                return false
+            }
+            h.oldLen = v
+            pos = (RdPatch.digitsEnd(s (pos + 1)))
+        }
+        if ((RdPatch.startsWith((substring s pos (strlen s)) " +")) == false) {
+            return false
+        }
+        pos = (pos + 2)
+        v = (RdPatch.numberAt(s pos))
+        if (v < 0) {
+            return false
+        }
+        h.newStart = v
+        h.newLen = 1
+        pos = (RdPatch.digitsEnd(s pos))
+        if ((pos < (strlen s)) && ((charAt s pos) == 44)) {
+            v = (RdPatch.numberAt(s (pos + 1)))
+            if (v < 0) {
+                return false
+            }
+            h.newLen = v
+            pos = (RdPatch.digitsEnd(s (pos + 1)))
+        }
+        def rest:string (substring s pos (strlen s))
+        if ((RdPatch.startsWith(rest " @@")) == false) {
+            return false
+        }
+        rest = (substring rest 3 (strlen rest))
+        if (RdPatch.startsWith(rest " ")) {
+            rest = (substring rest 1 (strlen rest))
+        }
+        h.section = (RdPatch.dropCR(rest))
+        return true
+    }
+
+    static sfn parse:RdPatchFile (text:string) {
+        def pf (new RdPatchFile())
+        def src:[string] (strsplit text "\n")
+        def n:int (array_length src)
+        def i:int 0
+        def sawHeader:boolean false
+        def sawOther:boolean false
+        def sawDiff:boolean false
+        while (i < n) {
+            def raw:string (itemAt src i)
+            def s:string (RdPatch.dropCR(raw))
+            if (RdPatch.startsWith(s "@@")) {
+                def h (new RdPatchHunk())
+                if ((RdPatch.parseHeader(s h)) == false) {
+                    push pf.errors ((("line " + (to_string (i + 1))) + ": bad hunk header: ") + s)
+                    return pf
+                }
+                def hi:int (array_length pf.hunks)
+                if (hi > 0) {
+                    def prev:RdPatchHunk (itemAt pf.hunks (hi - 1))
+                    if ((h.oldFirst()) < ((prev.oldFirst()) + prev.oldLen)) {
+                        push pf.errors ((("line " + (to_string (i + 1))) + ": hunk overlaps or precedes the one before: ") + s)
+                        return pf
+                    }
+                }
+                def oldNo:int (h.oldFirst())
+                def newNo:int (h.newFirst())
+                def oldSeen:int 0
+                def newSeen:int 0
+                def last:string ""
+                i = (i + 1)
+                while ((i < n) && ((oldSeen < h.oldLen) || (newSeen < h.newLen))) {
+                    def l:string (itemAt src i)
+                    def pl (new RdPatchLine())
+                    if ((strlen l) == 0) {
+                        ; a context line whose lone space was stripped
+                        pl.kind = "same"
+                    } {
+                        def c:int (charAt l 0)
+                        if (c == 32) {
+                            pl.kind = "same"
+                            pl.text = (substring l 1 (strlen l))
+                        } {
+                            if (c == 45) {
+                                pl.kind = "del"
+                                pl.text = (substring l 1 (strlen l))
+                            } {
+                                if (c == 43) {
+                                    pl.kind = "add"
+                                    pl.text = (substring l 1 (strlen l))
+                                } {
+                                    if (c == 92) {
+                                        RdPatch.markNoNewline(h last)
+                                        i = (i + 1)
+                                        continue
+                                    }
+                                    push pf.errors ((("line " + (to_string (i + 1))) + ": unexpected line in hunk: ") + l)
+                                    return pf
+                                }
+                            }
+                        }
+                    }
+                    if (pl.kind != "add") {
+                        pl.oldLine = oldNo
+                        oldNo = (oldNo + 1)
+                        oldSeen = (oldSeen + 1)
+                    }
+                    if (pl.kind != "del") {
+                        pl.newLine = newNo
+                        newNo = (newNo + 1)
+                        newSeen = (newSeen + 1)
+                    }
+                    if (pl.kind == "add") {
+                        pf.added = (pf.added + 1)
+                    }
+                    if (pl.kind == "del") {
+                        pf.removed = (pf.removed + 1)
+                    }
+                    last = pl.kind
+                    push h.lines pl
+                    i = (i + 1)
+                }
+                ; a marker after the hunk's last line
+                if (i < n) {
+                    def after:string (itemAt src i)
+                    if (((strlen after) > 0) && ((charAt after 0) == 92)) {
+                        RdPatch.markNoNewline(h last)
+                        i = (i + 1)
+                    }
+                }
+                if ((oldSeen > h.oldLen) || (newSeen > h.newLen)) {
+                    push pf.errors ((("hunk " + (to_string (hi + 1))) + ": more lines than the header says: ") + s)
+                    return pf
+                }
+                if ((oldSeen < h.oldLen) || (newSeen < h.newLen)) {
+                    def msg:string ((("hunk " + (to_string (hi + 1))) + ": patch ends early: ") + s)
+                    msg = (((((msg + " (") + (to_string oldSeen)) + " old and ") + (to_string newSeen)) + " new lines)")
+                    push pf.errors msg
+                    return pf
+                }
+                push pf.hunks h
+                continue
+            }
+            if (RdPatch.startsWith(s "diff ")) {
+                if (sawDiff || ((array_length pf.hunks) > 0)) {
+                    push pf.errors (("line " + (to_string (i + 1))) + ": a second file; parse one file's diff at a time")
+                    return pf
+                }
+                sawDiff = true
+                sawHeader = true
+            } {
+                if ((RdPatch.startsWith(s "--- ")) && ((array_length pf.hunks) == 0)) {
+                    pf.oldPath = (RdPatch.headerPath((substring s 4 (strlen s))))
+                    sawHeader = true
+                } {
+                    if ((RdPatch.startsWith(s "+++ ")) && ((array_length pf.hunks) == 0)) {
+                        pf.newPath = (RdPatch.headerPath((substring s 4 (strlen s))))
+                        sawHeader = true
+                    } {
+                        if ((RdPatch.startsWith(s "--- ")) || (RdPatch.startsWith(s "+++ "))) {
+                            push pf.errors (("line " + (to_string (i + 1))) + ": a second file; parse one file's diff at a time")
+                            return pf
+                        }
+                        if ((strlen (trim s)) > 0) {
+                            sawOther = true
+                        }
+                    }
+                }
+            }
+            i = (i + 1)
+        }
+        if (((array_length pf.hunks) == 0) && (sawOther && (sawHeader == false))) {
+            push pf.errors "no hunk found"
+        }
+        return pf
+    }
+
+    static sfn markNoNewline:void (h:RdPatchHunk last:string) {
+        if (last == "del") {
+            h.oldNoNewline = true
+        }
+        if (last == "add") {
+            h.newNoNewline = true
+        }
+        if (last == "same") {
+            h.oldNoNewline = true
+            h.newNoNewline = true
+        }
+    }
+
+    ; ------------------------------------------------------- apply, reverse
+
+    ; base -> new text
+    static sfn apply:RdPatchResult (base:string patch:RdPatchFile) {
+        return (RdPatch.run(base patch true))
+    }
+
+    ; new text -> base
+    static sfn reverse:RdPatchResult (head:string patch:RdPatchFile) {
+        return (RdPatch.run(head patch false))
+    }
+
+    ; parse and apply in one step; parse errors come back as the message
+    static sfn applyText:RdPatchResult (base:string patchText:string) {
+        def pf:RdPatchFile (RdPatch.parse(patchText))
+        if ((pf.ok()) == false) {
+            def r (new RdPatchResult())
+            r.ok = false
+            r.message = (pf.error())
+            return r
+        }
+        return (RdPatch.run(base pf true))
+    }
+
+    static sfn reverseText:RdPatchResult (head:string patchText:string) {
+        def pf:RdPatchFile (RdPatch.parse(patchText))
+        if ((pf.ok()) == false) {
+            def r (new RdPatchResult())
+            r.ok = false
+            r.message = (pf.error())
+            return r
+        }
+        return (RdPatch.run(head pf false))
+    }
+
+    ; is the line on the side we read from (forward: old) / write to
+    static sfn onFrom:boolean (l:RdPatchLine forward:boolean) {
+        if forward {
+            return (l.kind != "add")
+        }
+        return (l.kind != "del")
+    }
+
+    static sfn onTo:boolean (l:RdPatchLine forward:boolean) {
+        if forward {
+            return (l.kind != "del")
+        }
+        return (l.kind != "add")
+    }
+
+    ; 0-based index of the hunk's first line on the side we read from
+    static sfn fromIndex:int (h:RdPatchHunk forward:boolean) {
+        if forward {
+            return ((h.oldFirst()) - 1)
+        }
+        return ((h.newFirst()) - 1)
+    }
+
+    static sfn fromLen:int (h:RdPatchHunk forward:boolean) {
+        if forward {
+            return h.oldLen
+        }
+        return h.newLen
+    }
+
+    static sfn toLen:int (h:RdPatchHunk forward:boolean) {
+        if forward {
+            return h.newLen
+        }
+        return h.oldLen
+    }
+
+    static sfn run:RdPatchResult (text:string patch:RdPatchFile forward:boolean) {
+        def res (new RdPatchResult())
+        if ((patch.ok()) == false) {
+            res.ok = false
+            res.message = (patch.error())
+            return res
+        }
+        def src:[string] (strsplit text "\n")
+        def out:[string]
+        def pos:int 0
+        def n:int (array_length src)
+        for patch.hunks h:RdPatchHunk hi {
+            def at:int (RdPatch.fromIndex(h forward))
+            if (at > n) {
+                RdPatch.fail(res hi (at + 1) "" "" "hunk starts past the end of the text")
+                return res
+            }
+            while (pos < at) {
+                push out (itemAt src pos)
+                pos = (pos + 1)
+            }
+            if ((RdPatch.hunkInto(res hi h src pos 0 out forward)) == false) {
+                return res
+            }
+            pos = (pos + (RdPatch.fromLen(h forward)))
+            ; a final newline added or dropped (git's no-newline marker)
+            def fromNoNL:boolean h.oldNoNewline
+            def toNoNL:boolean h.newNoNewline
+            if (forward == false) {
+                fromNoNL = h.newNoNewline
+                toNoNL = h.oldNoNewline
+            }
+            if (fromNoNL && (toNoNL == false)) {
+                if (pos != n) {
+                    RdPatch.fail(res hi (pos + 1) "" (itemAt src pos) "no newline at end of file expected here")
+                    return res
+                }
+                push out ""
+            }
+            if (toNoNL && (fromNoNL == false)) {
+                if ((pos != (n - 1)) || ((itemAt src pos) != "")) {
+                    def got:string ""
+                    if (pos < n) {
+                        got = (itemAt src pos)
+                    }
+                    RdPatch.fail(res hi (pos + 1) "" got "end of file with a final newline expected here")
+                    return res
+                }
+                pos = (pos + 1)
+            }
+        }
+        while (pos < n) {
+            push out (itemAt src pos)
+            pos = (pos + 1)
+        }
+        res.text = (join out "\n")
+        return res
+    }
+
+    ; the hunk over src from index `at`; lineBase is the line number of
+    ; src[0] minus 1. Appends the other side to out; false on a mismatch.
+    static sfn hunkInto:boolean (res:RdPatchResult hi:int h:RdPatchHunk src:[string] at:int lineBase:int out:[string] forward:boolean) {
+        def n:int (array_length src)
+        def p:int at
+        for h.lines l:RdPatchLine li {
+            if (RdPatch.onFrom(l forward)) {
+                if (p >= n) {
+                    RdPatch.fail(res hi ((lineBase + p) + 1) l.text "" "text ends inside the hunk")
+                    return false
+                }
+                def found:string (itemAt src p)
+                if (found != l.text) {
+                    RdPatch.fail(res hi ((lineBase + p) + 1) l.text found "line does not match")
+                    return false
+                }
+                p = (p + 1)
+            }
+            if (RdPatch.onTo(l forward)) {
+                push out l.text
+            }
+        }
+        return true
+    }
+
+    static sfn fail:void (res:RdPatchResult hi:int line:int expected:string got:string msg:string) {
+        res.ok = false
+        res.hunk = hi
+        res.line = line
+        res.expected = expected
+        res.got = got
+        res.message = (((("hunk " + (to_string (hi + 1))) + ", line ") + (to_string line)) + (": " + msg))
+    }
+
+    ; ------------------------------------------------------- partial texts
+
+    ; One range of lines (1-based start) of a text, for `range` below.
+    static sfn range:RdPatchRange (start:int lines:[string]) {
+        def r (new RdPatchRange())
+        r.start = start
+        r.lines = lines
+        return r
+    }
+
+    ; lines `first`..`last` (1-based, inclusive) of a whole text as a range
+    static sfn cut:RdPatchRange (text:string first:int last:int) {
+        def src:[string] (strsplit text "\n")
+        def l:[string]
+        def i:int (first - 1)
+        while ((i < last) && (i < (array_length src))) {
+            if (i >= 0) {
+                push l (itemAt src i)
+            }
+            i = (i + 1)
+        }
+        def s:int first
+        if (s < 1) {
+            s = 1
+        }
+        return (RdPatch.range(s l))
+    }
+
+    ; Rebuild the other side of a text known only in parts. `forward` true:
+    ; the ranges are of the old text and come back as new-text ranges; false:
+    ; head ranges back to base ranges. Ranges must not overlap and are taken
+    ; in order of their start. A hunk applies when all of its lines on the
+    ; given side lie in one range; hunks elsewhere are listed in `outside`
+    ; and still shift the line numbers of the ranges after them.
+    static sfn partial:RdPatchPartial (patch:RdPatchFile ranges:[RdPatchRange] forward:boolean) {
+        def res (new RdPatchPartial())
+        if ((patch.ok()) == false) {
+            res.ok = false
+            res.message = (patch.error())
+            return res
+        }
+        def nh:int (array_length patch.hunks)
+        ; range index each hunk applies in, -1 none
+        def owner:[int]
+        def crosses:[boolean]
+        for patch.hunks h:RdPatchHunk hi {
+            def at:int (RdPatch.fromIndex(h forward))
+            def len:int (RdPatch.fromLen(h forward))
+            def own:int -1
+            def cross:boolean false
+            for ranges r:RdPatchRange ri {
+                def s0:int (r.start - 1)
+                def e0:int (s0 + (array_length r.lines))
+                if (own < 0) {
+                    if ((at >= s0) && ((at + len) <= e0)) {
+                        own = ri
+                    } {
+                        if ((at < e0) && ((at + len) > s0)) {
+                            cross = true
+                        }
+                    }
+                }
+            }
+            if (own >= 0) {
+                cross = false
+            }
+            push owner own
+            push crosses cross
+            if (own >= 0) {
+                push res.applied hi
+            } {
+                push res.outside hi
+                if cross {
+                    push res.crossing hi
+                }
+            }
+        }
+        def ok:boolean true
+        for ranges r:RdPatchRange ri {
+            def s0:int (r.start - 1)
+            def e0:int (s0 + (array_length r.lines))
+            def outR (new RdPatchRange())
+            ; shift from hunks wholly before this range
+            def shift:int 0
+            def k:int 0
+            while (k < nh) {
+                def hk:RdPatchHunk (itemAt patch.hunks k)
+                if ((itemAt owner k) != ri) {
+                    def at:int (RdPatch.fromIndex(hk forward))
+                    if ((at + (RdPatch.fromLen(hk forward))) <= s0) {
+                        shift = (shift + ((RdPatch.toLen(hk forward)) - (RdPatch.fromLen(hk forward))))
+                    }
+                    if ((at < e0) && ((at + (RdPatch.fromLen(hk forward))) > s0)) {
+                        outR.complete = false
+                    }
+                }
+                k = (k + 1)
+            }
+            outR.start = (r.start + shift)
+            def rr (new RdPatchResult())
+            def pos:int 0
+            def n:int (array_length r.lines)
+            k = 0
+            while ((k < nh) && ok) {
+                if ((itemAt owner k) == ri) {
+                    def h:RdPatchHunk (itemAt patch.hunks k)
+                    def at2:int ((RdPatch.fromIndex(h forward)) - s0)
+                    while (pos < at2) {
+                        push outR.lines (itemAt r.lines pos)
+                        pos = (pos + 1)
+                    }
+                    if ((RdPatch.hunkInto(rr k h r.lines pos s0 outR.lines forward)) == false) {
+                        ok = false
+                        res.ok = false
+                        res.line = rr.line
+                        res.expected = rr.expected
+                        res.got = rr.got
+                        res.hunk = rr.hunk
+                        res.message = rr.message
+                    }
+                    pos = (pos + (RdPatch.fromLen(h forward)))
+                }
+                k = (k + 1)
+            }
+            while (pos < n) {
+                push outR.lines (itemAt r.lines pos)
+                pos = (pos + 1)
+            }
+            push res.ranges outR
+        }
+        return res
+    }
+
+    ; ----------------------------------------------------------- line maps
+
+    ; the old line of new line `line`, 0 when the line was added
+    static sfn newToOld:int (patch:RdPatchFile line:int) {
+        return (RdPatch.mapLine(patch line false))
+    }
+
+    ; the new line of old line `line`, 0 when the line was removed
+    static sfn oldToNew:int (patch:RdPatchFile line:int) {
+        return (RdPatch.mapLine(patch line true))
+    }
+
+    ; fromOld true: old -> new
+    static sfn mapLine:int (patch:RdPatchFile line:int fromOld:boolean) {
+        def delta:int 0
+        for patch.hunks h:RdPatchHunk hi {
+            def first:int (h.newFirst())
+            def len:int h.newLen
+            def otherLen:int h.oldLen
+            if fromOld {
+                first = (h.oldFirst())
+                len = h.oldLen
+                otherLen = h.newLen
+            }
+            if (line < first) {
+                return (line + delta)
+            }
+            if (line < (first + len)) {
+                for h.lines l:RdPatchLine li {
+                    if fromOld {
+                        if (l.oldLine == line) {
+                            return l.newLine
+                        }
+                    } {
+                        if (l.newLine == line) {
+                            return l.oldLine
+                        }
+                    }
+                }
+                return 0
+            }
+            delta = (delta + (otherLen - len))
+        }
+        return (line + delta)
+    }
+
+    ; Where on the new side old line `line` was removed: the first new line
+    ; of its hunk; when the hunk has no new lines, the new line after the
+    ; removal, or the one before it at the end of the new text. 0 when the
+    ; line was not removed (or the new text is empty). newCount is the new
+    ; text's line count; pass -1 when it is not known.
+    static sfn removedAt:int (patch:RdPatchFile line:int newCount:int) {
+        return (RdPatch.changeAt(patch line true newCount))
+    }
+
+    ; the same for an added new line: where it goes on the old side
+    static sfn addedAt:int (patch:RdPatchFile line:int oldCount:int) {
+        return (RdPatch.changeAt(patch line false oldCount))
+    }
+
+    static sfn changeAt:int (patch:RdPatchFile line:int fromOld:boolean otherCount:int) {
+        for patch.hunks h:RdPatchHunk hi {
+            for h.lines l:RdPatchLine li {
+                def hit:boolean false
+                if fromOld {
+                    hit = ((l.kind == "del") && (l.oldLine == line))
+                } {
+                    hit = ((l.kind == "add") && (l.newLine == line))
+                }
+                if hit {
+                    def start:int h.oldStart
+                    def len:int h.oldLen
+                    if fromOld {
+                        start = h.newStart
+                        len = h.newLen
+                    }
+                    if (len > 0) {
+                        return start
+                    }
+                    if (otherCount == 0) {
+                        return 0
+                    }
+                    if ((otherCount > 0) && ((start + 1) > otherCount)) {
+                        return start
+                    }
+                    return (start + 1)
+                }
+            }
+        }
+        return 0
+    }
+}
