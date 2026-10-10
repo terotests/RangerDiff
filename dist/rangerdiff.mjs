@@ -6290,3 +6290,726 @@ export class RdOtHub  {
     return out;
   };
 }
+export class RdPatchLine  {
+  constructor() {
+    this.kind = "same";
+    this.text = "";
+    this.oldLine = 0;
+    this.newLine = 0;
+  }
+}
+export class RdPatchHunk  {
+  constructor() {
+    this.oldStart = 0;
+    this.oldLen = 0;
+    this.newStart = 0;
+    this.newLen = 0;
+    this.section = "";
+    this.lines = [];
+    this.oldNoNewline = false;
+    this.newNoNewline = false;
+  }
+  oldFirst () {
+    if ( this.oldLen == 0 ) {
+      return this.oldStart + 1;
+    }
+    return this.oldStart;
+  };
+  newFirst () {
+    if ( this.newLen == 0 ) {
+      return this.newStart + 1;
+    }
+    return this.newStart;
+  };
+}
+export class RdPatchFile  {
+  constructor() {
+    this.oldPath = "";
+    this.newPath = "";
+    this.hunks = [];
+    this.errors = [];
+    this.added = 0;
+    this.removed = 0;
+  }
+  ok () {
+    return this.errors.length == 0;
+  };
+  error () {
+    if ( this.errors.length == 0 ) {
+      return "";
+    }
+    return this.errors[0];
+  };
+}
+export class RdPatchResult  {
+  constructor() {
+    this.ok = true;
+    this.text = "";
+    this.line = 0;
+    this.expected = "";
+    this.got = "";
+    this.hunk = -1;
+    this.message = "";
+  }
+}
+export class RdPatchRange  {
+  constructor() {
+    this.start = 1;
+    this.lines = [];
+    this.complete = true;
+  }
+  end () {
+    return this.start + this.lines.length;
+  };
+}
+export class RdPatchPartial  {
+  constructor() {
+    this.ok = true;
+    this.ranges = [];
+    this.applied = [];
+    this.outside = [];
+    this.crossing = [];
+    this.line = 0;
+    this.expected = "";
+    this.got = "";
+    this.hunk = -1;
+    this.message = "";
+  }
+}
+export class RdPatch  {
+}
+RdPatch.startsWith = function(s, p) {
+  const n = p.length;
+  if ( s.length < n ) {
+    return false;
+  }
+  return s.substring(0, n ) == p;
+};
+RdPatch.dropCR = function(s) {
+  const n = s.length;
+  if ( n > 0 && s.charCodeAt(n - 1 ) == 13 ) {
+    return s.substring(0, n - 1 );
+  }
+  return s;
+};
+RdPatch.headerPath = function(s) {
+  let p = s;
+  const tab = p.indexOf("\t");
+  if ( tab >= 0 ) {
+    p = p.substring(0, tab );
+  }
+  if ( RdPatch.startsWith(p, "a/") || RdPatch.startsWith(p, "b/") ) {
+    p = p.substring(2, p.length );
+  }
+  return p;
+};
+RdPatch.numberAt = function(s, pos) {
+  const n = s.length;
+  let v = 0;
+  let i = pos;
+  while (i < n) {
+    const c = s.charCodeAt(i );
+    if ( c < 48 || c > 57 ) {
+      break;
+    }
+    v = v * 10 + (c - 48);
+    i = i + 1;
+  };
+  if ( i == pos ) {
+    return -1;
+  }
+  return v;
+};
+RdPatch.digitsEnd = function(s, pos) {
+  const n = s.length;
+  let i = pos;
+  while (i < n) {
+    const c = s.charCodeAt(i );
+    if ( c < 48 || c > 57 ) {
+      break;
+    }
+    i = i + 1;
+  };
+  return i;
+};
+RdPatch.parseHeader = function(s, h) {
+  if ( RdPatch.startsWith(s, "@@ -") == false ) {
+    return false;
+  }
+  let pos = 4;
+  let v = RdPatch.numberAt(s, pos);
+  if ( v < 0 ) {
+    return false;
+  }
+  h.oldStart = v;
+  h.oldLen = 1;
+  pos = RdPatch.digitsEnd(s, pos);
+  if ( pos < s.length && s.charCodeAt(pos ) == 44 ) {
+    v = RdPatch.numberAt(s, (pos + 1));
+    if ( v < 0 ) {
+      return false;
+    }
+    h.oldLen = v;
+    pos = RdPatch.digitsEnd(s, (pos + 1));
+  }
+  if ( RdPatch.startsWith(s.substring(pos, s.length ), " +") == false ) {
+    return false;
+  }
+  pos = pos + 2;
+  v = RdPatch.numberAt(s, pos);
+  if ( v < 0 ) {
+    return false;
+  }
+  h.newStart = v;
+  h.newLen = 1;
+  pos = RdPatch.digitsEnd(s, pos);
+  if ( pos < s.length && s.charCodeAt(pos ) == 44 ) {
+    v = RdPatch.numberAt(s, (pos + 1));
+    if ( v < 0 ) {
+      return false;
+    }
+    h.newLen = v;
+    pos = RdPatch.digitsEnd(s, (pos + 1));
+  }
+  let rest = s.substring(pos, s.length );
+  if ( RdPatch.startsWith(rest, " @@") == false ) {
+    return false;
+  }
+  rest = rest.substring(3, rest.length );
+  if ( RdPatch.startsWith(rest, " ") ) {
+    rest = rest.substring(1, rest.length );
+  }
+  h.section = RdPatch.dropCR(rest);
+  return true;
+};
+RdPatch.parse = function(text) {
+  const pf = new RdPatchFile();
+  const src = text.split("\n");
+  const n = src.length;
+  let i = 0;
+  let sawHeader = false;
+  let sawOther = false;
+  let sawDiff = false;
+  while (i < n) {
+    const raw = src[i];
+    const s = RdPatch.dropCR(raw);
+    if ( RdPatch.startsWith(s, "@@") ) {
+      const h = new RdPatchHunk();
+      if ( RdPatch.parseHeader(s, h) == false ) {
+        pf.errors.push((("line " + ((i + 1).toString())) + ": bad hunk header: ") + s);
+        return pf;
+      }
+      const hi = pf.hunks.length;
+      if ( hi > 0 ) {
+        const prev = pf.hunks[(hi - 1)];
+        if ( h.oldFirst() < prev.oldFirst() + prev.oldLen ) {
+          pf.errors.push((("line " + ((i + 1).toString())) + ": hunk overlaps or precedes the one before: ") + s);
+          return pf;
+        }
+      }
+      let oldNo = h.oldFirst();
+      let newNo = h.newFirst();
+      let oldSeen = 0;
+      let newSeen = 0;
+      let last = "";
+      i = i + 1;
+      while (i < n && (oldSeen < h.oldLen || newSeen < h.newLen)) {
+        const l = src[i];
+        const pl = new RdPatchLine();
+        if ( l.length == 0 ) {
+          pl.kind = "same";
+        } else {
+          const c = l.charCodeAt(0 );
+          if ( c == 32 ) {
+            pl.kind = "same";
+            pl.text = l.substring(1, l.length );
+          } else {
+            if ( c == 45 ) {
+              pl.kind = "del";
+              pl.text = l.substring(1, l.length );
+            } else {
+              if ( c == 43 ) {
+                pl.kind = "add";
+                pl.text = l.substring(1, l.length );
+              } else {
+                if ( c == 92 ) {
+                  RdPatch.markNoNewline(h, last);
+                  i = i + 1;
+                  continue;
+                }
+                pf.errors.push((("line " + ((i + 1).toString())) + ": unexpected line in hunk: ") + l);
+                return pf;
+              }
+            }
+          }
+        }
+        if ( pl.kind != "add" ) {
+          pl.oldLine = oldNo;
+          oldNo = oldNo + 1;
+          oldSeen = oldSeen + 1;
+        }
+        if ( pl.kind != "del" ) {
+          pl.newLine = newNo;
+          newNo = newNo + 1;
+          newSeen = newSeen + 1;
+        }
+        if ( pl.kind == "add" ) {
+          pf.added = pf.added + 1;
+        }
+        if ( pl.kind == "del" ) {
+          pf.removed = pf.removed + 1;
+        }
+        last = pl.kind;
+        h.lines.push(pl);
+        i = i + 1;
+      };
+      if ( i < n ) {
+        const after = src[i];
+        if ( after.length > 0 && after.charCodeAt(0 ) == 92 ) {
+          RdPatch.markNoNewline(h, last);
+          i = i + 1;
+        }
+      }
+      if ( oldSeen > h.oldLen || newSeen > h.newLen ) {
+        pf.errors.push((("hunk " + ((hi + 1).toString())) + ": more lines than the header says: ") + s);
+        return pf;
+      }
+      if ( oldSeen < h.oldLen || newSeen < h.newLen ) {
+        let msg = (("hunk " + ((hi + 1).toString())) + ": patch ends early: ") + s;
+        msg = ((((msg + " (") + (oldSeen.toString())) + " old and ") + (newSeen.toString())) + " new lines)";
+        pf.errors.push(msg);
+        return pf;
+      }
+      pf.hunks.push(h);
+      continue;
+    }
+    if ( RdPatch.startsWith(s, "diff ") ) {
+      if ( sawDiff || pf.hunks.length > 0 ) {
+        pf.errors.push(("line " + ((i + 1).toString())) + ": a second file; parse one file's diff at a time");
+        return pf;
+      }
+      sawDiff = true;
+      sawHeader = true;
+    } else {
+      if ( RdPatch.startsWith(s, "--- ") && pf.hunks.length == 0 ) {
+        pf.oldPath = RdPatch.headerPath(s.substring(4, s.length ));
+        sawHeader = true;
+      } else {
+        if ( RdPatch.startsWith(s, "+++ ") && pf.hunks.length == 0 ) {
+          pf.newPath = RdPatch.headerPath(s.substring(4, s.length ));
+          sawHeader = true;
+        } else {
+          if ( RdPatch.startsWith(s, "--- ") || RdPatch.startsWith(s, "+++ ") ) {
+            pf.errors.push(("line " + ((i + 1).toString())) + ": a second file; parse one file's diff at a time");
+            return pf;
+          }
+          if ( s.trim().length > 0 ) {
+            sawOther = true;
+          }
+        }
+      }
+    }
+    i = i + 1;
+  };
+  if ( pf.hunks.length == 0 && (sawOther && sawHeader == false) ) {
+    pf.errors.push("no hunk found");
+  }
+  return pf;
+};
+RdPatch.markNoNewline = function(h, last) {
+  if ( last == "del" ) {
+    h.oldNoNewline = true;
+  }
+  if ( last == "add" ) {
+    h.newNoNewline = true;
+  }
+  if ( last == "same" ) {
+    h.oldNoNewline = true;
+    h.newNoNewline = true;
+  }
+};
+RdPatch.apply = function(base, patch) {
+  return RdPatch.run(base, patch, true);
+};
+RdPatch.reverse = function(head, patch) {
+  return RdPatch.run(head, patch, false);
+};
+RdPatch.applyText = function(base, patchText) {
+  const pf = RdPatch.parse(patchText);
+  if ( pf.ok() == false ) {
+    const r = new RdPatchResult();
+    r.ok = false;
+    r.message = pf.error();
+    return r;
+  }
+  return RdPatch.run(base, pf, true);
+};
+RdPatch.reverseText = function(head, patchText) {
+  const pf = RdPatch.parse(patchText);
+  if ( pf.ok() == false ) {
+    const r = new RdPatchResult();
+    r.ok = false;
+    r.message = pf.error();
+    return r;
+  }
+  return RdPatch.run(head, pf, false);
+};
+RdPatch.onFrom = function(l, forward) {
+  if ( forward ) {
+    return l.kind != "add";
+  }
+  return l.kind != "del";
+};
+RdPatch.onTo = function(l, forward) {
+  if ( forward ) {
+    return l.kind != "del";
+  }
+  return l.kind != "add";
+};
+RdPatch.fromIndex = function(h, forward) {
+  if ( forward ) {
+    return h.oldFirst() - 1;
+  }
+  return h.newFirst() - 1;
+};
+RdPatch.fromLen = function(h, forward) {
+  if ( forward ) {
+    return h.oldLen;
+  }
+  return h.newLen;
+};
+RdPatch.toLen = function(h, forward) {
+  if ( forward ) {
+    return h.newLen;
+  }
+  return h.oldLen;
+};
+RdPatch.run = function(text, patch, forward) {
+  const res = new RdPatchResult();
+  if ( patch.ok() == false ) {
+    res.ok = false;
+    res.message = patch.error();
+    return res;
+  }
+  const src = text.split("\n");
+  let out = [];
+  let pos = 0;
+  const n = src.length;
+  // Loop start
+  for ( let hi = 0; hi < patch.hunks.length; hi++) {
+    var h = patch.hunks[hi];
+    const at = RdPatch.fromIndex(h, forward);
+    if ( at > n ) {
+      RdPatch.fail(
+        res,
+        hi,
+        at + 1,
+        "",
+        "",
+        "hunk starts past the end of the text"
+      );
+      return res;
+    }
+    while (pos < at) {
+      out.push(src[pos]);
+      pos = pos + 1;
+    };
+    if ( RdPatch.hunkInto(res, hi, h, src, pos, 0, out, forward) == false ) {
+      return res;
+    }
+    pos = pos + RdPatch.fromLen(h, forward);
+    let fromNoNL = h.oldNoNewline;
+    let toNoNL = h.newNoNewline;
+    if ( forward == false ) {
+      fromNoNL = h.newNoNewline;
+      toNoNL = h.oldNoNewline;
+    }
+    if ( fromNoNL && toNoNL == false ) {
+      if ( pos != n ) {
+        RdPatch.fail(
+          res,
+          hi,
+          pos + 1,
+          "",
+          src[pos],
+          "no newline at end of file expected here"
+        );
+        return res;
+      }
+      out.push("");
+    }
+    if ( toNoNL && fromNoNL == false ) {
+      if ( pos != n - 1 || src[pos] != "" ) {
+        let got = "";
+        if ( pos < n ) {
+          got = src[pos];
+        }
+        RdPatch.fail(
+          res,
+          hi,
+          pos + 1,
+          "",
+          got,
+          "end of file with a final newline expected here"
+        );
+        return res;
+      }
+      pos = pos + 1;
+    }
+  }
+  while (pos < n) {
+    out.push(src[pos]);
+    pos = pos + 1;
+  };
+  res.text = out.join("\n");
+  return res;
+};
+RdPatch.hunkInto = function(res, hi, h, src, at, lineBase, out, forward) {
+  const n = src.length;
+  let p = at;
+  // Loop start
+  for ( const l of h.lines) {
+    if ( RdPatch.onFrom(l, forward) ) {
+      if ( p >= n ) {
+        RdPatch.fail(
+          res,
+          hi,
+          (lineBase + p) + 1,
+          l.text,
+          "",
+          "text ends inside the hunk"
+        );
+        return false;
+      }
+      const found = src[p];
+      if ( found != l.text ) {
+        RdPatch.fail(
+          res,
+          hi,
+          (lineBase + p) + 1,
+          l.text,
+          found,
+          "line does not match"
+        );
+        return false;
+      }
+      p = p + 1;
+    }
+    if ( RdPatch.onTo(l, forward) ) {
+      out.push(l.text);
+    }
+  }
+  return true;
+};
+RdPatch.fail = function(res, hi, line, expected, got, msg) {
+  res.ok = false;
+  res.hunk = hi;
+  res.line = line;
+  res.expected = expected;
+  res.got = got;
+  res.message = ((("hunk " + ((hi + 1).toString())) + ", line ") + (line.toString())) + (": " + msg);
+};
+RdPatch.range = function(start, lines) {
+  const r = new RdPatchRange();
+  r.start = start;
+  r.lines = lines;
+  return r;
+};
+RdPatch.cut = function(text, first, last) {
+  const src = text.split("\n");
+  let l = [];
+  let i = first - 1;
+  while (i < last && i < src.length) {
+    if ( i >= 0 ) {
+      l.push(src[i]);
+    }
+    i = i + 1;
+  };
+  let s = first;
+  if ( s < 1 ) {
+    s = 1;
+  }
+  return RdPatch.range(s, l);
+};
+RdPatch.partial = function(patch, ranges, forward) {
+  const res = new RdPatchPartial();
+  if ( patch.ok() == false ) {
+    res.ok = false;
+    res.message = patch.error();
+    return res;
+  }
+  const nh = patch.hunks.length;
+  let owner = [];
+  let crosses = [];
+  // Loop start
+  for ( let hi = 0; hi < patch.hunks.length; hi++) {
+    var h = patch.hunks[hi];
+    const at = RdPatch.fromIndex(h, forward);
+    const __len = RdPatch.fromLen(h, forward);
+    let own = -1;
+    let cross = false;
+    // Loop start
+    for ( let ri = 0; ri < ranges.length; ri++) {
+      var r = ranges[ri];
+      const s0 = r.start - 1;
+      const e0 = s0 + r.lines.length;
+      if ( own < 0 ) {
+        if ( at >= s0 && at + __len <= e0 ) {
+          own = ri;
+        } else {
+          if ( at < e0 && at + __len > s0 ) {
+            cross = true;
+          }
+        }
+      }
+    }
+    if ( own >= 0 ) {
+      cross = false;
+    }
+    owner.push(own);
+    crosses.push(cross);
+    if ( own >= 0 ) {
+      res.applied.push(hi);
+    } else {
+      res.outside.push(hi);
+      if ( cross ) {
+        res.crossing.push(hi);
+      }
+    }
+  }
+  let ok = true;
+  // Loop start
+  for ( let ri_1 = 0; ri_1 < ranges.length; ri_1++) {
+    var r_1 = ranges[ri_1];
+    const s0_1 = r_1.start - 1;
+    const e0_1 = s0_1 + r_1.lines.length;
+    const outR = new RdPatchRange();
+    let shift = 0;
+    let k = 0;
+    while (k < nh) {
+      const hk = patch.hunks[k];
+      if ( owner[k] != ri_1 ) {
+        const at_1 = RdPatch.fromIndex(hk, forward);
+        if ( at_1 + RdPatch.fromLen(hk, forward) <= s0_1 ) {
+          shift = shift + (RdPatch.toLen(hk, forward) - RdPatch.fromLen(hk, forward));
+        }
+        if ( at_1 < e0_1 && at_1 + RdPatch.fromLen(hk, forward) > s0_1 ) {
+          outR.complete = false;
+        }
+      }
+      k = k + 1;
+    };
+    outR.start = r_1.start + shift;
+    const rr = new RdPatchResult();
+    let pos = 0;
+    const n = r_1.lines.length;
+    k = 0;
+    while (k < nh && ok) {
+      if ( owner[k] == ri_1 ) {
+        const h_1 = patch.hunks[k];
+        const at2 = RdPatch.fromIndex(h_1, forward) - s0_1;
+        while (pos < at2) {
+          outR.lines.push(r_1.lines[pos]);
+          pos = pos + 1;
+        };
+        if ( RdPatch.hunkInto(rr, k, h_1, r_1.lines, pos, s0_1, outR.lines, forward) == false ) {
+          ok = false;
+          res.ok = false;
+          res.line = rr.line;
+          res.expected = rr.expected;
+          res.got = rr.got;
+          res.hunk = rr.hunk;
+          res.message = rr.message;
+        }
+        pos = pos + RdPatch.fromLen(h_1, forward);
+      }
+      k = k + 1;
+    };
+    while (pos < n) {
+      outR.lines.push(r_1.lines[pos]);
+      pos = pos + 1;
+    };
+    res.ranges.push(outR);
+  }
+  return res;
+};
+RdPatch.newToOld = function(patch, line) {
+  return RdPatch.mapLine(patch, line, false);
+};
+RdPatch.oldToNew = function(patch, line) {
+  return RdPatch.mapLine(patch, line, true);
+};
+RdPatch.mapLine = function(patch, line, fromOld) {
+  let delta = 0;
+  // Loop start
+  for ( const h of patch.hunks) {
+    let first = h.newFirst();
+    let __len = h.newLen;
+    let otherLen = h.oldLen;
+    if ( fromOld ) {
+      first = h.oldFirst();
+      __len = h.oldLen;
+      otherLen = h.newLen;
+    }
+    if ( line < first ) {
+      return line + delta;
+    }
+    if ( line < first + __len ) {
+      // Loop start
+      for ( const l of h.lines) {
+        if ( fromOld ) {
+          if ( l.oldLine == line ) {
+            return l.newLine;
+          }
+        } else {
+          if ( l.newLine == line ) {
+            return l.oldLine;
+          }
+        }
+      }
+      return 0;
+    }
+    delta = delta + (otherLen - __len);
+  }
+  return line + delta;
+};
+RdPatch.removedAt = function(patch, line, newCount) {
+  return RdPatch.changeAt(patch, line, true, newCount);
+};
+RdPatch.addedAt = function(patch, line, oldCount) {
+  return RdPatch.changeAt(patch, line, false, oldCount);
+};
+RdPatch.changeAt = function(patch, line, fromOld, otherCount) {
+  // Loop start
+  for ( const h of patch.hunks) {
+    // Loop start
+    for ( let li = 0; li < h.lines.length; li++) {
+      var l = h.lines[li];
+      let hit = false;
+      if ( fromOld ) {
+        hit = l.kind == "del" && l.oldLine == line;
+      } else {
+        hit = l.kind == "add" && l.newLine == line;
+      }
+      if ( hit ) {
+        let start = h.oldStart;
+        let __len = h.oldLen;
+        if ( fromOld ) {
+          start = h.newStart;
+          __len = h.newLen;
+        }
+        if ( __len > 0 ) {
+          return start;
+        }
+        if ( otherCount == 0 ) {
+          return 0;
+        }
+        if ( otherCount > 0 && start + 1 > otherCount ) {
+          return start;
+        }
+        return start + 1;
+      }
+    }
+  }
+  return 0;
+};

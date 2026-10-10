@@ -13,6 +13,7 @@ when the same presentation was edited in two places.
 | `RdPng` | PNG delta on the inflated pixel rows instead of the compressed bytes. |
 | `RdSmart` | picks the right one of the above per file. |
 | `RdText` | line diff (Myers), unified view, three-way merge (diff3) with conflict regions. |
+| `RdPatch` | unified diffs in: parse one file's `git diff` or a bare GitHub PR `patch` (hunks with line numbers and section text, `\ No newline at end of file`), apply forward and reverse with the first mismatch reported, rebuild the other side of a text known only in parts (line ranges), and old ↔ new line maps. |
 | `RdOt` | real-time editing: text deltas in the Quill Delta form (`retain` / `insert` / `delete`, UTF-16 lengths on every target: text is `RdOtStr`, a string in JavaScript and `[]uint16` in Go), apply, compose, invert, transform, caret transform, a diff that never splits a surrogate pair. `RdOtClient` is one editor's side (ot.js's client), `RdOtHub` the server's (one order, an edit on an older revision transformed over the ones since). Next to Yjs in [COLLAB.md](COLLAB.md). |
 | `RdRepo` | blobs (SHA-256), trees (path → blob + optional recipe), commits with parents. The newest version is stored whole, older ones as reverse deltas. Log, diff between commits, merge base, three-way merge of two commits. Storage is the host's: `takeDirty()` / `stored(id)` / `load(bytes)`. |
 
@@ -35,6 +36,18 @@ import { RdSmart, RdRepo } from "./rangerdiff.mjs";
 const buf = (u8) => { const ab = u8.slice().buffer; ab._view = new DataView(ab); return ab; };
 const delta = RdSmart.diff(buf(oldBytes), buf(newBytes));
 const r = RdSmart.apply(buf(oldBytes), delta);   // r.ok, r.error, r.data
+```
+
+Text patches need no buffers:
+
+```js
+import { RdPatch } from "./rangerdiff.mjs";
+
+const p = RdPatch.parse(prFile.patch);            // p.ok(), p.errors, p.hunks
+const base = RdPatch.reverse(headText, p);        // base.ok, base.text, base.line / expected / got
+RdPatch.newToOld(p, 120);                         // 0 when head line 120 was added
+// only head lines 40-88 known: rebuild those base lines
+const part = RdPatch.partial(p, [RdPatch.range(40, headLines)], false);
 ```
 
 ## Develop

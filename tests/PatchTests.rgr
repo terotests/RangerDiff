@@ -1,0 +1,379 @@
+; SPDX-License-Identifier: MIT
+; Unified diffs: parse, apply, reverse, partial texts, line maps.
+
+Import "../src/RdText.rgr"
+Import "../src/RdPatch.rgr"
+Import "RdTest.rgr"
+
+class PatchTests {
+
+    sfn gitPatch:string () {
+        def l:[string]
+        push l "diff --git a/src/app.js b/src/app.js"
+        push l "index 83db48f..bf2a3c4 100644"
+        push l "--- a/src/app.js"
+        push l "+++ b/src/app.js"
+        push l "@@ -1,5 +1,6 @@ function main() {"
+        push l " line1"
+        push l " line2"
+        push l "-line3"
+        push l "+line3 changed"
+        push l "+inserted"
+        push l " line4"
+        push l " line5"
+        push l ""
+        return (join l "\n")
+    }
+
+    sfn parsing:void (T:RdTest) {
+        T.start("parse")
+        def pf:RdPatchFile (RdPatch.parse((PatchTests.gitPatch())))
+        T.ok(pf.ok() ("parses: " + (pf.error())))
+        T.eqStr(pf.oldPath "src/app.js" "old path")
+        T.eqStr(pf.newPath "src/app.js" "new path")
+        T.eqInt((array_length pf.hunks) 1 "one hunk")
+        T.eqInt(pf.added 2 "added")
+        T.eqInt(pf.removed 1 "removed")
+        def h:RdPatchHunk (itemAt pf.hunks 0)
+        T.eqInt(h.oldStart 1 "oldStart")
+        T.eqInt(h.oldLen 5 "oldLen")
+        T.eqInt(h.newStart 1 "newStart")
+        T.eqInt(h.newLen 6 "newLen")
+        T.eqStr(h.section "function main() {" "section")
+        T.eqInt((array_length h.lines) 7 "hunk lines")
+        def l2:RdPatchLine (itemAt h.lines 2)
+        T.eqStr(l2.kind "del" "del kind")
+        T.eqStr(l2.text "line3" "del text")
+        T.eqInt(l2.oldLine 3 "del old line")
+        T.eqInt(l2.newLine 0 "del has no new line")
+        def l4:RdPatchLine (itemAt h.lines 4)
+        T.eqStr(l4.kind "add" "add kind")
+        T.eqInt(l4.oldLine 0 "add has no old line")
+        T.eqInt(l4.newLine 4 "add new line")
+        def l5:RdPatchLine (itemAt h.lines 5)
+        T.eqStr(l5.kind "same" "same kind")
+        T.eqInt(l5.oldLine 4 "same old line")
+        T.eqInt(l5.newLine 5 "same new line")
+        ; header without lengths, no section
+        def p2:RdPatchFile (RdPatch.parse("@@ -3 +3 @@\n-x\n+y"))
+        T.ok(p2.ok() "short header")
+        def h2:RdPatchHunk (itemAt p2.hunks 0)
+        T.eqInt(h2.oldLen 1 "default length 1")
+        T.eqStr(h2.section "" "no section")
+        T.eqStr(p2.oldPath "" "bare patch: no path")
+        ; two hunks of a bare GitHub patch
+        def p3:RdPatchFile (RdPatch.parse("@@ -1,2 +1,2 @@\n-a\n+A\n b\n@@ -10,2 +10,3 @@ class X\n j\n+k\n l"))
+        T.ok(p3.ok() "two hunks")
+        T.eqInt((array_length p3.hunks) 2 "two hunks count")
+        def h3:RdPatchHunk (itemAt p3.hunks 1)
+        T.eqStr(h3.section "class X" "second section")
+        ; errors
+        def e1:RdPatchFile (RdPatch.parse("@@ -1,2 +1 @\n a"))
+        T.ok(((e1.ok()) == false) "bad header is an error")
+        T.ok(((indexOf (e1.error()) "bad hunk header") >= 0) ("bad header message: " + (e1.error())))
+        def e2:RdPatchFile (RdPatch.parse("@@ -1,3 +1,3 @@\n a\n b"))
+        T.ok(((e2.ok()) == false) "early end is an error")
+        T.ok(((indexOf (e2.error()) "ends early") >= 0) ("early end message: " + (e2.error())))
+        def e3:RdPatchFile (RdPatch.parse("@@ -1,2 +1,2 @@\n a\n?b"))
+        T.ok(((e3.ok()) == false) "unexpected line is an error")
+        def e4:RdPatchFile (RdPatch.parse("hello world\nnothing here"))
+        T.ok(((e4.ok()) == false) "no hunk is an error")
+        def e5:RdPatchFile (RdPatch.parse(((PatchTests.gitPatch()) + "diff --git a/b b/b\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-x\n+y\n")))
+        T.ok(((e5.ok()) == false) "second file is an error")
+        def e6:RdPatchFile (RdPatch.parse("@@ -5,1 +5,1 @@\n-a\n+b\n@@ -2,1 +2,1 @@\n-c\n+d"))
+        T.ok(((e6.ok()) == false) "hunks out of order is an error")
+        def e7:RdPatchFile (RdPatch.parse(""))
+        T.ok(e7.ok() "empty patch is fine")
+        T.eqInt((array_length e7.hunks) 0 "empty patch has no hunks")
+        def bad:RdPatchResult (RdPatch.applyText("a" "@@ -1 +1 @\n"))
+        T.ok((bad.ok == false) "applyText reports parse errors")
+    }
+
+    sfn applying:void (T:RdTest) {
+        T.start("apply / reverse")
+        def base:string "line1\nline2\nline3\nline4\nline5\n"
+        def head:string "line1\nline2\nline3 changed\ninserted\nline4\nline5\n"
+        def pf:RdPatchFile (RdPatch.parse((PatchTests.gitPatch())))
+        def r:RdPatchResult (RdPatch.apply(base pf))
+        T.ok(r.ok ("applies: " + r.message))
+        T.eqStr(r.text head "forward")
+        def b:RdPatchResult (RdPatch.reverse(head pf))
+        T.ok(b.ok ("reverses: " + b.message))
+        T.eqStr(b.text base "backward")
+        ; bare GitHub patch in the middle of a text
+        def gh:RdPatchResult (RdPatch.applyText("a\nb\nc\nd\ne" "@@ -2,3 +2,3 @@\n b\n-c\n+C\n d"))
+        T.eqStr(gh.text "a\nb\nC\nd\ne" "bare patch applies")
+        ; insertion at the top, deletion at the end
+        def top:RdPatchResult (RdPatch.applyText("x\ny\n" "@@ -0,0 +1,2 @@\n+new1\n+new2"))
+        T.eqStr(top.text "new1\nnew2\nx\ny\n" "insert at top")
+        def topBack:RdPatchResult (RdPatch.reverseText(top.text "@@ -0,0 +1,2 @@\n+new1\n+new2"))
+        T.eqStr(topBack.text "x\ny\n" "insert at top, reversed")
+        def del:RdPatchResult (RdPatch.applyText("a\nb\nc\nd\n" "@@ -3,2 +2,0 @@\n-c\n-d"))
+        T.eqStr(del.text "a\nb\n" "delete at end")
+        def delBack:RdPatchResult (RdPatch.reverseText("a\nb\n" "@@ -3,2 +2,0 @@\n-c\n-d"))
+        T.eqStr(delBack.text "a\nb\nc\nd\n" "delete at end, reversed")
+    }
+
+    sfn mismatches:void (T:RdTest) {
+        T.start("mismatch")
+        def pf:RdPatchFile (RdPatch.parse((PatchTests.gitPatch())))
+        def r:RdPatchResult (RdPatch.apply("line1\nline2\nLINE3\nline4\nline5\n" pf))
+        T.ok((r.ok == false) "removed line differs")
+        T.eqInt(r.line 3 "mismatch line")
+        T.eqStr(r.expected "line3" "expected")
+        T.eqStr(r.got "LINE3" "got")
+        T.eqInt(r.hunk 0 "hunk index")
+        def r2:RdPatchResult (RdPatch.apply("line1\nline2\nline3\nline4\nline 5\n" pf))
+        T.eqInt(r2.line 5 "context line differs")
+        T.eqStr(r2.got "line 5" "context got")
+        def r3:RdPatchResult (RdPatch.reverse("line1\nline2\nline3 changed\nline4\nline5\n" pf))
+        T.ok((r3.ok == false) "reverse mismatch")
+        T.eqInt(r3.line 4 "reverse mismatch line")
+        T.eqStr(r3.expected "inserted" "reverse expected")
+        T.eqStr(r3.got "line4" "reverse got")
+        def r4:RdPatchResult (RdPatch.apply("line1\nline2" pf))
+        T.ok((r4.ok == false) "short text")
+        T.eqStr(r4.expected "line3" "short text expected")
+        T.eqStr(r4.got "" "short text got nothing")
+        T.ok(((indexOf r4.message "ends inside") >= 0) ("short text message: " + r4.message))
+    }
+
+    sfn fwd:string (t:string pf:RdPatchFile) {
+        def r:RdPatchResult (RdPatch.apply(t pf))
+        return r.text
+    }
+
+    sfn back:string (t:string pf:RdPatchFile) {
+        def r:RdPatchResult (RdPatch.reverse(t pf))
+        return r.text
+    }
+
+    sfn fwdText:string (t:string p:string) {
+        def r:RdPatchResult (RdPatch.applyText(t p))
+        return r.text
+    }
+
+    sfn backText:string (t:string p:string) {
+        def r:RdPatchResult (RdPatch.reverseText(t p))
+        return r.text
+    }
+
+    sfn fwdOk:boolean (t:string pf:RdPatchFile) {
+        def r:RdPatchResult (RdPatch.apply(t pf))
+        return r.ok
+    }
+
+    sfn fwdTextOk:boolean (t:string p:string) {
+        def r:RdPatchResult (RdPatch.applyText(t p))
+        return r.ok
+    }
+
+    sfn noNewline:void (T:RdTest) {
+        T.start("no newline at end of file")
+        def p1:string "--- a/f\n+++ b/f\n@@ -1,2 +1,3 @@\n a\n-b\n\\ No newline at end of file\n+b\n+c\n"
+        def pf:RdPatchFile (RdPatch.parse(p1))
+        T.ok(pf.ok() ("parses: " + (pf.error())))
+        def h:RdPatchHunk (itemAt pf.hunks 0)
+        T.ok(h.oldNoNewline "old side marked")
+        T.ok((h.newNoNewline == false) "new side not marked")
+        T.eqStr((PatchTests.fwd("a\nb" pf)) "a\nb\nc\n" "newline added")
+        T.eqStr((PatchTests.back("a\nb\nc\n" pf)) "a\nb" "newline dropped on reverse")
+        T.ok(((PatchTests.fwdOk("a\nb\n" pf)) == false) "old text with a newline does not match")
+        def p2:string "@@ -1 +1 @@\n-x\n+y\n\\ No newline at end of file"
+        T.eqStr((PatchTests.fwdText("x\n" p2)) "y" "newline removed")
+        T.eqStr((PatchTests.backText("y" p2)) "x\n" "newline restored on reverse")
+        T.ok(((PatchTests.fwdTextOk("x" p2)) == false) "missing newline where one is expected")
+        def p3:string "@@ -1,2 +1,2 @@\n-a\n+A\n b\n\\ No newline at end of file"
+        def pf3:RdPatchFile (RdPatch.parse(p3))
+        def h3:RdPatchHunk (itemAt pf3.hunks 0)
+        T.ok((h3.oldNoNewline && h3.newNoNewline) "context marker is both sides")
+        T.eqStr((PatchTests.fwd("a\nb" pf3)) "A\nb" "both sides without newline")
+        T.eqStr((PatchTests.back("A\nb" pf3)) "a\nb" "both sides, reversed")
+    }
+
+    sfn numbered:string (n:int prefix:string) {
+        def out:[string]
+        def i:int 1
+        while (i <= n) {
+            push out ((prefix + " ") + (to_string i))
+            i = (i + 1)
+        }
+        return (join out "\n")
+    }
+
+    sfn joinRange:string (r:RdPatchRange) {
+        return (join r.lines "\n")
+    }
+
+    sfn partials:void (T:RdTest) {
+        T.start("partial texts")
+        def a:string (PatchTests.numbered(300 "line"))
+        def b:string (replace a "line 50\n" "line 50 edited\n")
+        b = (replace b "line 60\n" "line 60\nnew A\nnew B\n")
+        b = (replace b "line 210\nline 211\n" "")
+        b = (replace b "line 280\n" "line 280 edited\n")
+        def pf:RdPatchFile (RdPatch.parse((RdText.unified((RdText.diff(a b)) 3))))
+        T.eqInt((array_length pf.hunks) 4 "four hunks")
+        ; head lines 40-88 and 200-260 only
+        def given:[RdPatchRange]
+        push given (RdPatch.cut(b 40 88))
+        push given (RdPatch.cut(b 200 260))
+        def p:RdPatchPartial (RdPatch.partial(pf given false))
+        T.ok(p.ok ("partial ok: " + p.message))
+        T.eqInt((array_length p.applied) 3 "three hunks inside")
+        T.eqInt((array_length p.outside) 1 "one hunk outside")
+        T.eqInt((itemAt p.outside 0) 3 "the last hunk is outside")
+        T.eqInt((array_length p.crossing) 0 "none crossing")
+        def r0:RdPatchRange (itemAt p.ranges 0)
+        T.eqInt(r0.start 40 "first base range start")
+        T.eqStr((PatchTests.joinRange(r0)) (PatchTests.joinRange((RdPatch.cut(a 40 86)))) "first base range")
+        def r1:RdPatchRange (itemAt p.ranges 1)
+        T.eqInt(r1.start 198 "second base range start")
+        T.eqStr((PatchTests.joinRange(r1)) (PatchTests.joinRange((RdPatch.cut(a 198 260)))) "second base range")
+        T.ok((r0.complete && r1.complete) "both complete")
+        ; forward: base parts to head parts
+        def baseParts:[RdPatchRange]
+        push baseParts (RdPatch.cut(a 190 300))
+        def f:RdPatchPartial (RdPatch.partial(pf baseParts true))
+        T.ok(f.ok ("forward partial ok: " + f.message))
+        def f0:RdPatchRange (itemAt f.ranges 0)
+        T.eqInt(f0.start 192 "forward start shifted by the insert")
+        T.eqStr((PatchTests.joinRange(f0)) (PatchTests.joinRange((RdPatch.cut(b 192 300)))) "forward range")
+        ; a range that cuts a hunk in half
+        def cutting:[RdPatchRange]
+        push cutting (RdPatch.cut(b 45 52))
+        def c:RdPatchPartial (RdPatch.partial(pf cutting false))
+        T.eqInt((array_length c.crossing) 1 "crossing hunk reported")
+        T.eqInt((itemAt c.crossing 0) 0 "crossing hunk index")
+        def c0:RdPatchRange (itemAt c.ranges 0)
+        T.ok((c0.complete == false) "range marked incomplete")
+        ; a wrong line inside a range
+        def wrong:[RdPatchRange]
+        def w:RdPatchRange (RdPatch.cut(b 40 88))
+        def wl:[string]
+        for w.lines s:string i {
+            if (s == "line 49") {
+                push wl "line forty-nine"
+            } {
+                push wl s
+            }
+        }
+        push wrong (RdPatch.range(40 wl))
+        def m:RdPatchPartial (RdPatch.partial(pf wrong false))
+        T.ok((m.ok == false) "mismatch inside a range")
+        T.eqInt(m.line 49 "partial mismatch line")
+        T.eqStr(m.expected "line 49" "partial expected")
+        T.eqStr(m.got "line forty-nine" "partial got")
+    }
+
+    sfn lineMaps:void (T:RdTest) {
+        T.start("line maps")
+        def pf:RdPatchFile (RdPatch.parse((PatchTests.gitPatch())))
+        T.eqInt((RdPatch.newToOld(pf 1)) 1 "context before")
+        T.eqInt((RdPatch.newToOld(pf 3)) 0 "added line")
+        T.eqInt((RdPatch.newToOld(pf 4)) 0 "second added line")
+        T.eqInt((RdPatch.newToOld(pf 5)) 4 "context after")
+        T.eqInt((RdPatch.newToOld(pf 50)) 49 "past the hunk")
+        T.eqInt((RdPatch.oldToNew(pf 3)) 0 "removed line")
+        T.eqInt((RdPatch.oldToNew(pf 4)) 5 "old to new")
+        T.eqInt((RdPatch.oldToNew(pf 100)) 101 "old to new past the hunk")
+        T.eqInt((RdPatch.removedAt(pf 3 -1)) 1 "removed: first new line of its hunk")
+        T.eqInt((RdPatch.removedAt(pf 4 -1)) 0 "not removed")
+        T.eqInt((RdPatch.addedAt(pf 4 -1)) 1 "added: first old line of its hunk")
+        ; a hunk with no new lines
+        def d:RdPatchFile (RdPatch.parse("@@ -3,2 +2,0 @@\n-c\n-d\n@@ -10,1 +8,1 @@\n-j\n+J"))
+        T.eqInt((RdPatch.removedAt(d 3 -1)) 3 "removed: the new line after")
+        T.eqInt((RdPatch.removedAt(d 4 20)) 3 "removed: the new line after (count known)")
+        T.eqInt((RdPatch.removedAt(d 3 2)) 2 "removed at the end: the line before")
+        T.eqInt((RdPatch.removedAt(d 3 0)) 0 "new text empty")
+        T.eqInt((RdPatch.removedAt(d 10 -1)) 8 "replaced line")
+        T.eqInt((RdPatch.newToOld(d 2)) 2 "before the deletion")
+        T.eqInt((RdPatch.newToOld(d 3)) 5 "after the deletion")
+        T.eqInt((RdPatch.oldToNew(d 5)) 3 "old after the deletion")
+        T.eqInt((RdPatch.oldToNew(d 10)) 0 "replaced old line")
+        T.eqInt((RdPatch.newToOld(d 9)) 11 "after the second hunk")
+    }
+
+    ; random line edits, as in TextTests
+    sfn editLines:string (R:RdRandom text:string) {
+        def l:[string] (RdText.lines(text))
+        def out:[string]
+        for l s:string i {
+            def r:int (R.below(20))
+            if (r == 0) {
+                ; dropped
+            } {
+                if (r == 1) {
+                    push out (s + " (edited)")
+                } {
+                    if (r == 2) {
+                        push out s
+                        push out ("new line " + (to_string (R.below(1000))))
+                    } {
+                        push out s
+                    }
+                }
+            }
+        }
+        return (join out "\n")
+    }
+
+    sfn randomText:string (R:RdRandom n:int) {
+        def out:[string]
+        def i:int 0
+        while (i < n) {
+            push out ("line " + (to_string (R.below(50))))
+            i = (i + 1)
+        }
+        return (join out "\n")
+    }
+
+    sfn roundTrip:void (T:RdTest) {
+        T.start("RdText round trip")
+        def R (new RdRandom(4242))
+        def round:int 0
+        while (round < 200) {
+            def a:string (PatchTests.randomText(R (1 + (R.below(250)))))
+            if ((round % 2) == 0) {
+                a = (a + "\n")
+            }
+            def b:string (PatchTests.editLines(R a))
+            def ctx:int (1 + (round % 4))
+            def pf:RdPatchFile (RdPatch.parse((RdText.unified((RdText.diff(a b)) ctx))))
+            T.ok(pf.ok() ("parse round " + (to_string round)))
+            def f:RdPatchResult (RdPatch.apply(a pf))
+            T.ok((f.ok && (f.text == b)) ("apply round " + (to_string round)))
+            def r:RdPatchResult (RdPatch.reverse(b pf))
+            T.ok((r.ok && (r.text == a)) ("reverse round " + (to_string round)))
+            ; every mapped line is the same text on both sides
+            def al:[string] (RdText.lines(a))
+            def bl:[string] (RdText.lines(b))
+            def good:boolean true
+            for bl s:string j {
+                def o:int (RdPatch.newToOld(pf (j + 1)))
+                if (o > 0) {
+                    if ((o > (array_length al)) || ((itemAt al (o - 1)) != s)) {
+                        good = false
+                    }
+                    if ((RdPatch.oldToNew(pf o)) != (j + 1)) {
+                        good = false
+                    }
+                }
+            }
+            T.ok(good ("line maps round " + (to_string round)))
+            round = (round + 1)
+        }
+    }
+
+    sfn main:void () {
+        def T (new RdTest())
+        PatchTests.parsing(T)
+        PatchTests.applying(T)
+        PatchTests.mismatches(T)
+        PatchTests.noNewline(T)
+        PatchTests.partials(T)
+        PatchTests.lineMaps(T)
+        PatchTests.roundTrip(T)
+        T.done()
+    }
+}
