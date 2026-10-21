@@ -195,8 +195,9 @@ class RdBytes {
         def s:int 0
         def i:int start
         while (i < end) {
-            ; 5552 bytes keep both sums below 2^31 between reductions
-            def stop:int (i + 5552)
+            ; 3800 bytes keep both sums below 2^31 between reductions (zlib's
+            ; 5552 is the bound for 2^32; `int` is 32-bit signed on C++)
+            def stop:int (i + 3800)
             if (stop > end) {
                 stop = end
             }

@@ -1360,7 +1360,7 @@ RdBytes.adler32Range = function(b, start, end) {
   let s = 0;
   let i = start;
   while (i < end) {
-    let stop = i + 5552;
+    let stop = i + 3800;
     if ( stop > end ) {
       stop = end;
     }

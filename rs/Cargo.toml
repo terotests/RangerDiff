@@ -1,0 +1,20 @@
+# RangerDiff as strict Rust (Ranger PLAN_RUST_SYNTAX.md, stage R8): the same
+# library as ../src/*.rgr, built by cargo natively and by rgrc for the other
+# Ranger targets. ../src stays the version the JavaScript build ships until
+# the parity check (parity/) prints the same as the .rgr build.
+
+[package]
+name = "rangerdiff"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Plain std types (i64, Vec<u8>, String): no dependency, not even the ranger
+# prelude crate.
+[dependencies]
+
+[profile.dev]
+overflow-checks = false
+
+[workspace]

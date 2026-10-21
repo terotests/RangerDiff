@@ -1,0 +1,19 @@
+# The parity check of the strict-Rust RangerDiff: the ported test programs,
+# then digests of deltas over generated data. `cargo run` here, and rgrc of
+# src/main.rs for es6 / go / cpp, must print the same; the digest lines must
+# also equal what ../../parity/Parity.rgr prints with the .rgr library.
+
+[package]
+name = "rangerdiff_parity"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+rangerdiff = { path = ".." }
+
+[profile.dev]
+overflow-checks = false
+
+[workspace]
