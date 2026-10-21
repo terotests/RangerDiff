@@ -47,3 +47,28 @@ jobs:
         run: |
           npm run build
           git diff --exit-code dist/ || (echo "dist/rangerdiff.mjs is stale: run npm run build" && exit 1)
+
+  parity:
+    # the strict-Rust port (rs/): cargo, and rgrc for es6, go and cpp, must
+    # print the same; needs the Ranger with the R8 lowering
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: RangerDiff
+      - uses: actions/checkout@v4
+        with:
+          repository: terotests/Ranger
+          ref: 7ec8be84f35e38ba5b6b423e81029e693737e765
+          path: Ranger
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Parity
+        working-directory: RangerDiff
+        env:
+          RANGER_DIR: ${{ github.workspace }}/Ranger
+        run: npm run parity

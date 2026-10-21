@@ -12,7 +12,8 @@
     "bench": "node scripts/bench.mjs",
     "testdata": "python3 testdata/gen/make_files.py",
     "compare": "node scripts/compare.mjs",
-    "bench:collab": "node bench/collab.mjs"
+    "bench:collab": "node bench/collab.mjs",
+    "parity": "node scripts/parity.mjs"
   },
   "engines": {
     "node": ">=18"

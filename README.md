@@ -66,6 +66,24 @@ npm run testdata  # regenerates testdata/xlsx and testdata/images (openpyxl, Pil
 
 `testdata/md` holds sample decks from Sliqtly.
 
+## Strict Rust (rs/)
+
+`rs/` is the same library as plain Rust (crate `rangerdiff`, std only), in
+the subset that Ranger's Rust frontend reads: `cargo` builds it natively,
+and `rgrc` compiles the same `.rs` files to JavaScript, Go, C++ and the
+other Ranger targets. `rs/parity` is the test suite ported from `tests/`
+plus digest lines that pin the formats. It covers every module except
+`RdOt` and `RdPatch`, which are not ported yet.
+
+```
+npm run parity    # cargo run, then rgrc -l=es6/go/cpp: every target must
+                  # print what cargo printed, and parity/Parity.rgr (the
+                  # .rgr library) must print the same digests
+```
+
+Needs cargo, and go / g++ for those targets (a missing one is skipped).
+The tests read `testdata/`, so they run from the repository root.
+
 ## License
 
 MIT

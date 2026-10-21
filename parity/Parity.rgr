@@ -1,0 +1,137 @@
+; SPDX-License-Identifier: MIT
+; The digest lines of rs/parity/src/digest.rs, from the .rgr library. The
+; strict-Rust port must print exactly these (scripts/parity.mjs).
+
+Import "../src/RdDelta.rgr"
+Import "../src/RdRepo.rgr"
+Import "../tests/RdTest.rgr"
+
+class Parity {
+
+    sfn sumHex:string (b:buffer) {
+        def w (new RdWriter())
+        w.u32((RdBytes.adler32(b)))
+        return (RdBytes.hex(w.toBuffer()))
+    }
+
+    ; DeltaTests.mutate
+    sfn mutate:buffer (R:RdRandom b:buffer) {
+        def n:int (buffer_length b)
+        def kind:int (R.below(5))
+        def off:int (R.below((n + 1)))
+        def len:int (R.below(200))
+        if ((off + len) > n) {
+            len = (n - off)
+        }
+        def pre:buffer (buffer_slice b 0 off)
+        def post:buffer (buffer_slice b (off + len) n)
+        if (kind == 0) {
+            def mid:buffer (R.textBytes((1 + (R.below(300)))))
+            def rest:buffer (buffer_slice b off n)
+            return (RdBytes.concat((RdBytes.concat(pre mid)) rest))
+        }
+        if (kind == 1) {
+            return (RdBytes.concat(pre post))
+        }
+        if (kind == 2) {
+            def mid2:buffer (R.bytes(len))
+            return (RdBytes.concat((RdBytes.concat(pre mid2)) post))
+        }
+        if (kind == 3) {
+            def moved:buffer (buffer_slice b off (off + len))
+            return (RdBytes.concat((RdBytes.concat(pre post)) moved))
+        }
+        def blk:buffer (buffer_slice b off (off + len))
+        def at:int (R.below((n + 1)))
+        def p2:buffer (buffer_slice b 0 at)
+        def q2:buffer (buffer_slice b at n)
+        return (RdBytes.concat((RdBytes.concat(p2 blk)) q2))
+    }
+
+    sfn main:void () {
+        def w (new RdWriter())
+        w.varint(0)
+        w.varint(127)
+        w.varint(128)
+        w.varint(300000)
+        w.zigzag(-1)
+        w.zigzag(-70000)
+        w.u32(-1)
+        w.u32le(305419896)
+        w.u16le(4660)
+        w.text("päivää 🙂")
+        print ("digest writer " + (RdBytes.hex(w.toBuffer())))
+        def txt:buffer (RdBytes.fromText("Hyvää päivää, maailma 🙂 😀"))
+        print ((((("digest text " + (to_string (buffer_length txt))) + " ") + (RdBytes.hex(txt))) + " ") + (RdBytes.toText(txt)))
+        def R (new RdRandom(424242))
+        def round:int 0
+        while (round < 40) {
+            def size:int (R.below(30000))
+            def base:buffer (buffer_alloc 0)
+            if ((round % 2) == 0) {
+                base = R.textBytes(size)
+            } {
+                base = R.bytes(size)
+            }
+            def target:buffer base
+            def edits:int (1 + (R.below(4)))
+            def k:int 0
+            while (k < edits) {
+                target = (Parity.mutate(R target))
+                k = (k + 1)
+            }
+            def d:buffer (RdDelta.diff(base target))
+            def i:RdDeltaInfo (RdDelta.info(d))
+            def line:string ("digest delta " + (to_string round))
+            line = ((line + " ") + (to_string (buffer_length base)))
+            line = ((line + " ") + (to_string (buffer_length target)))
+            line = ((line + " ") + (to_string (buffer_length d)))
+            line = ((line + " ") + (Parity.sumHex(d)))
+            line = ((line + " ") + (to_string i.copies))
+            line = ((line + " ") + (to_string i.adds))
+            line = ((line + " ") + (to_string i.addBytes))
+            print line
+            round = (round + 1)
+        }
+        def small:buffer (RdDelta.diff((RdBytes.fromText("hello world, hello world")) (RdBytes.fromText("hello there world, hello world!"))))
+        print ("digest small " + (RdBytes.hex(small)))
+        Parity.files()
+    }
+
+    ; the container, PNG and repository formats on testdata/
+    sfn files:void () {
+        def base:buffer (buffer_read_file "testdata/xlsx" "base.xlsx")
+        def z:RdZipArchive (RdZip.read(base))
+        def sheet:RdZipEntry (unwrap (z.find("xl/worksheets/sheet1.xml")))
+        def enc:buffer (RdXlsx.encode((sheet.content())))
+        print ((("digest sheet " + (to_string (buffer_length enc))) + " ") + (Parity.sumHex(enc)))
+        def zw:buffer (RdZip.write(z.entries))
+        print ((((("digest zip " + (to_string (array_length z.entries))) + " ") + (to_string (buffer_length zw))) + " ") + (Parity.sumHex(zw)))
+        def names:[string] ([] _:string ("edit-cell.xlsx" "edit-row.xlsx" "insert-rows.xlsx" "delete-rows.xlsx" "add-sheet.xlsx" "style-header.xlsx" "edit-column.xlsx"))
+        for names n:string i {
+            def d:buffer (RdPack.diff(base (buffer_read_file "testdata/xlsx" n)))
+            print ((((("digest pack " + n) + " ") + (to_string (buffer_length d))) + " ") + (Parity.sumHex(d)))
+        }
+        def shot:buffer (buffer_read_file "testdata/images" "shot.png")
+        def pics:[string] ([] _:string ("shot-annotated.png" "shot-text.png"))
+        for pics pn:string j {
+            def target:buffer (buffer_read_file "testdata/images" pn)
+            def pd:buffer (RdPng.diff(shot target))
+            def r:RdApplyResult (RdPng.apply(shot pd))
+            print ((((((("digest png " + pn) + " ") + (to_string (buffer_length pd))) + " ") + (Parity.sumHex(pd))) + " ") + (Parity.sumHex(r.data)))
+        }
+        def R (new RdRepo())
+        def t (new RdTree())
+        push t.entries (R.entryOf("deck.md" (RdBytes.fromText("# Deck\n\nHello")) ""))
+        push t.entries (R.entryOf("media/shot.png" shot "{\"bright\":20}"))
+        def none:[string]
+        def c1:string (R.commitTree(t none "tero" "laptop" "2026-10-03T10:00:00Z" "First"))
+        def t2 (new RdTree())
+        push t2.entries (R.entryOf("deck.md" (RdBytes.fromText("# Deck\n\nHello again")) ""))
+        push t2.entries (R.entryOf("media/shot.png" (buffer_read_file "testdata/images" "shot-text.png") ""))
+        def parents:[string]
+        push parents c1
+        def c2:string (R.commitTree(t2 parents "tero" "laptop" "2026-10-03T10:01:00Z" "Second"))
+        print ((((("digest repo " + c1) + " ") + c2) + " ") + (to_string (R.storedBytes())))
+    }
+}
